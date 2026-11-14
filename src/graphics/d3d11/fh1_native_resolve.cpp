@@ -242,6 +242,18 @@ bool D3D11Fh1NativeResolve::PlanResolveMemory(const SourceRect& source,
     dest_info = (dest_info & ~0x38u) | (uint32_t(forced_endian & 7) << 3);
   }
 
+  // The destination carries the guest's own swap bit (dest_info 6, "swap red/blue"
+  // in the shader's constants comment). Inverting it exchanges red and blue for
+  // resolved content only - the presentation copies the guest output verbatim.
+  if (!depth && REXCVAR_GET(fh1_resolve_swap_rb)) {
+    static bool logged_swap = false;
+    if (!logged_swap) {
+      logged_swap = true;
+      REXGPU_INFO("D3D11 FH1 native resolve: fh1_resolve_swap_rb inverts the destination "
+                  "swap bit for colour resolves (3D content only)");
+    }
+    dest_info ^= 1u << 6;
+  }
   const Fh1SurfaceKey& owner = surface.key;
   const uint32_t host_sample_mode =
       owner.msaa == uint32_t(xenos::MsaaSamples::k2X) ? (surface.samples == 4 ? 2u : 1u) : 0u;

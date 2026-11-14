@@ -25,6 +25,10 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
+#include <string>
+
+// Trace-only: the colour render target bound for the most recent draw.
+static std::string g_trace_rt_key;
 #include <rex/graphics/d3d11/command_list.h>
 #include <rex/graphics/d3d11/fh1_native_resolve.h>
 // Defined once in the D3D12 command processor (same flag, both backends read
@@ -54,6 +58,7 @@ REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_from_swap);
 #include <rex/ui/d3d11/d3d11_presenter.h>
 #include <rex/ui/d3d11/d3d11_provider.h>
 #include <rex/ui/presenter.h>
+#include <rex/graphics/render_audit.h>
 
 namespace rex::graphics::d3d11 {
 
@@ -1032,6 +1037,21 @@ bool D3D11CommandProcessor::BindDrawRenderTargets(
       bound_depth_and_color_render_target_bits_out |= 1;
     }
   }
+  if (REXCVAR_GET(pinyon_draw_trace) || REXCVAR_GET(pinyon_audit)) {
+    for (uint32_t trace_slot = 1; trace_slot < 4; ++trace_slot) {
+      if (used_bits & (1u << trace_slot)) {
+        if (REXCVAR_GET(pinyon_draw_trace)) {
+          g_trace_rt_key = keys[trace_slot].Describe();
+        }
+        if (REXCVAR_GET(pinyon_audit)) {
+          rex::graphics::render_audit::NoteDraw(keys[trace_slot].Describe().c_str(),
+                                               uint32_t(keys[trace_slot].msaa),
+                                               keys[trace_slot].format, 0, 0, 0);
+        }
+        break;
+      }
+    }
+  }
   GetD3D11Provider().GetImmediateContext()->OMSetRenderTargets(
       rtv_count, rtv_count ? rtvs : nullptr, dsv);
   return true;
@@ -1058,6 +1078,40 @@ void D3D11CommandProcessor::UpdateFixedFunctionState(
     ff_viewport_ = viewport;
     ff_viewport_update_needed_ = false;
     context->RSSetViewports(1, &viewport);
+  }
+
+  if (REXCVAR_GET(pinyon_draw_trace)) {
+    static uint32_t draw_trace_logs = 0;
+    static float last_w = -1.0f, last_h = -1.0f;
+    const float trace_w = float(viewport_info.xy_extent[0]);
+    const float trace_h = float(viewport_info.xy_extent[1]);
+    if (draw_trace_logs < 80 && (trace_w != last_w || trace_h != last_h)) {
+      last_w = trace_w;
+      last_h = trace_h;
+      ++draw_trace_logs;
+      std::FILE* trace_file = std::fopen("E:/PinyonShift/work/.local/draw-trace.log", "a");
+      if (trace_file) {
+        std::fprintf(trace_file,
+                     "DRAW viewport=%.1fx%.1f+%.1f+%.1f z=%.3f..%.3f scissor=%ld,%ld %ldx%ld\n",
+                     trace_w, trace_h, double(viewport_info.xy_offset[0]),
+                     double(viewport_info.xy_offset[1]), double(viewport_info.z_min),
+                     double(viewport_info.z_max), LONG(scissor.offset[0]), LONG(scissor.offset[1]),
+                     LONG(scissor.extent[0]), LONG(scissor.extent[1]));
+        const bool trace_clip_disabled =
+            register_file_->Get<reg::PA_CL_CLIP_CNTL>().clip_disable != 0;
+        std::fprintf(trace_file,
+                     "NDC clip_disabled=%d scale=%.6f,%.6f,%.6f offset=%.6f,%.6f,%.6f"
+                     " uploaded=%.6f,%.6f\n",
+                     int(trace_clip_disabled), double(viewport_info.ndc_scale[0]),
+                     double(viewport_info.ndc_scale[1]), double(viewport_info.ndc_scale[2]),
+                     double(viewport_info.ndc_offset[0]), double(viewport_info.ndc_offset[1]),
+                     double(viewport_info.ndc_offset[2]),
+                     double(system_constants_.ndc_scale[0]),
+                     double(system_constants_.ndc_scale[1]));
+        std::fprintf(trace_file, "RT key=%s\n", g_trace_rt_key.c_str());
+        std::fclose(trace_file);
+      }
+    }
   }
 
   D3D11_RECT scissor_rect;
@@ -3728,6 +3782,37 @@ bool D3D11CommandProcessor::IssueCopy() {
       // itself it is the guest byte address the shader's layout math expects.
       const uint32_t resolve_dest_base =
           use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
+      if (REXCVAR_GET(pinyon_resolve_trace)) {
+        static uint32_t trace_logs = 0;
+        const uint32_t trace_width = uint32_t(source.rect.right - source.rect.left);
+        const uint32_t trace_height = uint32_t(source.rect.bottom - source.rect.top);
+        if (trace_logs < 600 && trace_width * trace_height >= 100000u &&
+            (trace_logs % 3) == 0) {
+          ++trace_logs;
+          std::FILE* trace_file = std::fopen("E:/PinyonShift/work/.local/resolve-trace.log", "a");
+          if (trace_file) {
+          std::fprintf(trace_file,
+                       "RESOLVE src=%ux%u+%u+%u dest_base=0x%X pitch=%u pack=%u endian=%u swap=%u "
+                       "scale=%u unscaled=%u extent=0x%X len=%u samples=%u\n",
+                       trace_width, trace_height, uint32_t(source.rect.left),
+                       uint32_t(source.rect.top), plan.dest_base, plan.dest_pitch,
+                       plan.dest_info & 7u, (plan.dest_info >> 3u) & 7u,
+                       (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 20u) & 3u,
+                       (plan.dest_info >> 22u) & 1u, plan.info.copy_dest_extent_start,
+                       plan.info.copy_dest_extent_length,
+                       uint32_t(source.surface ? source.surface->samples : 0));
+          std::fflush(trace_file);
+          std::fclose(trace_file);
+          }
+        }
+      }
+      if (REXCVAR_GET(pinyon_audit)) {
+        rex::graphics::render_audit::NoteResolve(
+            uint32_t(source.rect.right - source.rect.left),
+            uint32_t(source.rect.bottom - source.rect.top), plan.dest_pitch,
+            uint32_t(source.surface ? source.surface->samples : 0), plan.dest_info & 7u,
+            (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 22u) & 1u);
+      }
       complete = native_resolve_->ResolveToMemory(source, plan.resolve_key, plan.sample_select,
                                                   plan.dest_info, resolve_dest_base,
                                                   plan.dest_pitch, memory_target, true);
@@ -4119,6 +4204,11 @@ bool D3D11CommandProcessor::WaitForGpu() {
 
 void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  if (REXCVAR_GET(pinyon_audit)) {
+    rex::graphics::render_audit::SetContext("d3d11", "GTX 570", 1280, 720);
+    rex::graphics::render_audit::EnsureStarted();
+    rex::graphics::render_audit::EndFrame();
+  }
   // Phase 3 M2: the swap boundary flushes any recorded resolve work before the
   // swap's readback, surface dump or untiling upload reads GPU results. With
   // submission at the resolve boundary this is a safety net (normally empty).

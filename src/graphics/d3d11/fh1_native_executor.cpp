@@ -22,6 +22,7 @@
 #include <rex/graphics/fh1_edram_resolve.h>
 #include <rex/graphics/flags.h>
 #include <rex/logging.h>
+#include <rex/graphics/render_audit.h>
 
 // Defined in graphics/flags.cpp; declared here only, so the owner census does
 // not force every translation unit that includes flags.h to rebuild.
@@ -1830,6 +1831,23 @@ bool D3D11Fh1NativeExecutor::BindTargets(
       bound_depth_and_color_render_target_formats_out[i] = pending_keys_[i].format;
     }
     bound_depth_and_color_render_target_bits_out |= 1u << i;
+    if (REXCVAR_GET(pinyon_audit)) {
+      rex::graphics::render_audit::NoteDraw(pending_keys_[i].Describe().c_str(),
+                                           uint32_t(pending_keys_[i].msaa),
+                                           pending_keys_[i].format, 0, 0, 0);
+    }
+    if (REXCVAR_GET(pinyon_draw_trace)) {
+      static uint32_t rt_key_logs = 0;
+      if (rt_key_logs < 40) {
+        ++rt_key_logs;
+        std::FILE* key_file = std::fopen("E:/PinyonShift/work/.local/draw-trace.log", "a");
+        if (key_file) {
+          std::fprintf(key_file, "RTKEY %s samples=%u\n",
+                       pending_keys_[i].Describe().c_str(), uint32_t(surface->samples));
+          std::fclose(key_file);
+        }
+      }
+    }
   }
   if (pending_used_bits_ & 1) {
     D3D11Fh1NativeSurface* surface = pending_surfaces_[0];
