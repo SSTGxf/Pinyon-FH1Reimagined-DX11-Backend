@@ -65,6 +65,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -141,6 +142,16 @@ class D3D11Fh1NativeExecutor {
   // of the owner that wrote them (its two layout words).
   uint32_t ResolveSourceOwner(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1,
                               int32_t y1) const;
+
+  // Every EDRAM owner intersecting a copy's rectangle, with the tile count
+  // each one holds: the full census ResolveSourceOwner collapses to a single
+  // owner or kNoOwner. Tiles nobody claimed since Reset are reported under
+  // kNoOwner. Used by the all-owner provenance probe, which measures each
+  // owner's surface instead of only the one the copy names, so a resolve
+  // that reads an empty selected source can be told apart from one whose
+  // pixels live under another owner.
+  std::map<uint32_t, uint32_t> EnumerateResolveOwners(const Fh1SurfaceKey& key, int32_t x0,
+                                                       int32_t y0, int32_t x1, int32_t y1) const;
 
   // After the command processor issued the draw.
   void NativeDrawIssued(const Fh1DrawInfo& draw);

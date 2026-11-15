@@ -541,6 +541,11 @@ void D3D11Fh1NativeExecutor::ClaimTargetTiles(const SurfaceKey& key,
   // when the rectangle mixes owners (or already holds the claimant's tiles).
   const Fh1EdramTiles::RectClaim claim = tiles_.ClaimRect(
       key.base_tiles, pitch, packed_key, column_first, row_first, column_end, row_end);
+  if (REXCVAR_GET(pinyon_audit_passes)) {
+    rex::graphics::render_audit::NotePassClaim(
+        key.Describe().c_str(), left, top, right, bottom, column_first, column_end,
+        row_first, row_end, claim.previous_owner, packed_key, claim.per_row);
+  }
   if (claim.per_row) {
     for (uint32_t row = row_first; row < row_end; ++row) {
       const uint32_t row_first_tile = key.base_tiles + row * pitch + column_first;
@@ -1954,6 +1959,30 @@ uint32_t D3D11Fh1NativeExecutor::ResolveSourceOwner(const Fh1SurfaceKey& key, in
     return Fh1EdramTiles::kNoOwner;
   }
   return owner;
+}
+
+std::map<uint32_t, uint32_t> D3D11Fh1NativeExecutor::EnumerateResolveOwners(
+    const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1) const {
+  std::map<uint32_t, uint32_t> owners;
+  if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
+    return owners;
+  }
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const int32_t tile_width = int32_t(xenos::kEdramTileWidthSamples >> msaa_x_log2);
+  const int32_t tile_height = int32_t(xenos::kEdramTileHeightSamples >> msaa_y_log2);
+  const int32_t column_first = x0 / tile_width,
+                column_end = (x1 + tile_width - 1) / tile_width;
+  const int32_t row_first = y0 / tile_height, row_end = (y1 + tile_height - 1) / tile_height;
+  for (int32_t row = row_first; row < row_end; ++row) {
+    for (int32_t column = column_first; column < column_end; ++column) {
+      const uint32_t tile_owner = tiles_.Owner(key.base_tiles +
+                                               uint32_t(row) * key.pitch_tiles +
+                                               uint32_t(column));
+      ++owners[tile_owner];
+    }
+  }
+  return owners;
 }
 
 void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {

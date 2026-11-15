@@ -201,11 +201,41 @@ namespace {
 // Diagnostics: the composed frame, exactly as the display sees it, as an
 // uncompressed 32-bit BMP. The presenter's swap chain cannot be captured from
 // outside (flip model), so the frame is written from the back buffer itself.
-bool WriteTextureBmp(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
-                     const char* path) {
-  if (!device || !context || !texture) return false;
-  D3D11_TEXTURE2D_DESC desc;
+struct FrameDumpReport {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t sample_count = 0;
+  uint32_t row_pitch = 0;
+  uint64_t bytes_expected = 0;
+  uint64_t bytes_written = 0;
+  int32_t create_hresult = 0;
+  int32_t copy_query_status = 2;
+  int32_t map_hresult = 0;
+  const char* failure = "none";
+  bool ok = false;
+};
+
+// The composed frame, exactly as the display sees it, as an uncompressed 32-bit
+// BMP. The swap chain cannot be captured from outside, so the image is taken
+// from its back buffer: copy into a staging texture, wait for the copy to
+// complete on the GPU, map, then write. Every stage records its own result, and
+// ok is true only when the whole image payload reached the file.
+bool DumpTextureBmp(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11Texture2D* texture,
+                    const char* path, FrameDumpReport* report) {
+  FrameDumpReport local;
+  FrameDumpReport& r = report ? *report : local;
+  if (!device || !context || !texture) {
+    r.failure = "null_resource";
+    return false;
+  }
+  D3D11_TEXTURE2D_DESC desc = {};
   texture->GetDesc(&desc);
+  r.width = desc.Width;
+  r.height = desc.Height;
+  r.format = uint32_t(desc.Format);
+  r.sample_count = desc.SampleDesc.Count;
+
   D3D11_TEXTURE2D_DESC staging_desc = desc;
   staging_desc.Usage = D3D11_USAGE_STAGING;
   staging_desc.BindFlags = 0;
@@ -214,40 +244,90 @@ bool WriteTextureBmp(ID3D11Device* device, ID3D11DeviceContext* context, ID3D11T
   staging_desc.MipLevels = 1;
   staging_desc.ArraySize = 1;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
-  if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, &staging))) return false;
-  context->CopyResource(staging.Get(), texture);
-  D3D11_MAPPED_SUBRESOURCE mapped = {};
-  if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
-  std::FILE* file = std::fopen(path, "wb");
-  bool ok = false;
-  if (file) {
-    const uint32_t width = desc.Width, height = desc.Height;
-    const uint32_t image_size = width * height * 4;
-    uint8_t header[54] = {};
-    header[0] = 'B'; header[1] = 'M';
-    const uint32_t file_size = 54 + image_size;
-    std::memcpy(header + 2, &file_size, 4);
-    const uint32_t offset = 54;
-    std::memcpy(header + 10, &offset, 4);
-    const uint32_t info_size = 40;
-    std::memcpy(header + 14, &info_size, 4);
-    std::memcpy(header + 18, &width, 4);
-    const int32_t signed_height = int32_t(height);
-    std::memcpy(header + 22, &signed_height, 4);
-    const uint16_t planes = 1, bpp = 32;
-    std::memcpy(header + 26, &planes, 2);
-    std::memcpy(header + 28, &bpp, 2);
-    std::memcpy(header + 34, &image_size, 4);
-    ok = std::fwrite(header, 1, sizeof(header), file) == sizeof(header);
-    for (uint32_t y = 0; y < height && ok; ++y) {
-      const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
-                           size_t(mapped.RowPitch) * (height - 1 - y);
-      ok = std::fwrite(row, 1, size_t(width) * 4, file) == size_t(width) * 4;
-    }
-    std::fclose(file);
+  const HRESULT create_result = device->CreateTexture2D(&staging_desc, nullptr, &staging);
+  r.create_hresult = int32_t(create_result);
+  if (FAILED(create_result)) {
+    r.failure = "create_staging_failed";
+    return false;
   }
+
+  context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture, 0, nullptr);
+
+  D3D11_QUERY_DESC query_desc = {};
+  query_desc.Query = D3D11_QUERY_EVENT;
+  Microsoft::WRL::ComPtr<ID3D11Query> query;
+  if (SUCCEEDED(device->CreateQuery(&query_desc, &query))) {
+    context->End(query.Get());
+    context->Flush();
+    for (int spin = 0; spin < 250; ++spin) {
+      const HRESULT poll = context->GetData(query.Get(), nullptr, 0, 0);
+      if (poll == S_OK) {
+        r.copy_query_status = 0;
+        break;
+      }
+      if (poll != S_FALSE) {
+        r.copy_query_status = 3;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  } else {
+    r.copy_query_status = 4;
+  }
+  if (r.copy_query_status != 0) {
+    r.failure = "copy_not_complete";
+    return false;
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  const HRESULT map_result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  r.map_hresult = int32_t(map_result);
+  if (FAILED(map_result)) {
+    r.failure = "map_failed";
+    return false;
+  }
+  r.row_pitch = mapped.RowPitch;
+
+  const uint32_t row_bytes = desc.Width * 4u;
+  r.bytes_expected = 54ull + uint64_t(row_bytes) * uint64_t(desc.Height);
+  std::FILE* file = std::fopen(path, "wb");
+  if (!file) {
+    context->Unmap(staging.Get(), 0);
+    r.failure = "open_failed";
+    return false;
+  }
+  uint8_t header[54] = {};
+  header[0] = 'B';
+  header[1] = 'M';
+  const uint32_t image_size = row_bytes * desc.Height;
+  const uint32_t file_size = 54 + image_size;
+  std::memcpy(header + 2, &file_size, 4);
+  const uint32_t offset = 54;
+  std::memcpy(header + 10, &offset, 4);
+  const uint32_t info_size = 40;
+  std::memcpy(header + 14, &info_size, 4);
+  std::memcpy(header + 18, &desc.Width, 4);
+  const int32_t signed_height = int32_t(desc.Height);
+  std::memcpy(header + 22, &signed_height, 4);
+  const uint16_t planes = 1, bpp = 32;
+  std::memcpy(header + 26, &planes, 2);
+  std::memcpy(header + 28, &bpp, 2);
+  std::memcpy(header + 34, &image_size, 4);
+
+  uint64_t written = std::fwrite(header, 1, sizeof(header), file);
+  for (uint32_t y = 0; y < desc.Height; ++y) {
+    // Bottom-up, as BMP expects; the staging pitch may exceed the row width.
+    const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) +
+                         size_t(mapped.RowPitch) * size_t(desc.Height - 1 - y);
+    written += std::fwrite(row, 1, size_t(std::min(row_bytes, uint32_t(mapped.RowPitch))), file);
+  }
+  std::fclose(file);
   context->Unmap(staging.Get(), 0);
-  return ok;
+
+  r.bytes_written = written;
+  r.ok = written == r.bytes_expected;
+  r.failure = r.ok ? "none" : "short_write";
+  return r.ok;
 }
 
 struct GuestOutputColourMean {
@@ -1064,15 +1144,26 @@ Presenter::PaintResult D3D11Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // the presented image can be inspected without capturing the flip-model chain.
   if (REXCVAR_GET(pinyon_dump_frames)) {
     static uint32_t dump_frame = 0;
-    if ((++dump_frame % 300) == 1) {
+    if ((++dump_frame % 30) == 1) {
       Microsoft::WRL::ComPtr<ID3D11Resource> back_resource;
       back_buffer_rtv->GetResource(&back_resource);
       Microsoft::WRL::ComPtr<ID3D11Texture2D> back_texture;
       if (back_resource) {
         back_resource.As(&back_texture);
       }
-      const bool dumped = WriteTextureBmp(paint_device, device_context, back_texture.Get(),
-                                          "E:/PinyonShift/work/.local/frame.bmp");
+      char frame_path[256];
+      std::snprintf(frame_path, sizeof(frame_path),
+                    "E:/PinyonShift/work/.local/frames/frame_%06u.bmp", dump_frame);
+      FrameDumpReport back_report;
+      const bool dumped = DumpTextureBmp(paint_device, device_context, back_texture.Get(),
+                                         frame_path, &back_report);
+      REXLOG_INFO(
+          "D3D11Presenter: frame dump {} {}x{} format {} samples {} pitch {} expected {} "
+          "written {} create 0x{:08X} query {} map 0x{:08X} ({})",
+          frame_path, back_report.width, back_report.height, back_report.format,
+          back_report.sample_count, back_report.row_pitch, back_report.bytes_expected,
+          back_report.bytes_written, uint32_t(back_report.create_hresult),
+          back_report.copy_query_status, uint32_t(back_report.map_hresult), back_report.failure);
       if (guest_output_srv) {
         Microsoft::WRL::ComPtr<ID3D11Resource> guest_resource;
         guest_output_srv->GetResource(&guest_resource);
@@ -1080,7 +1171,17 @@ Presenter::PaintResult D3D11Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         if (guest_resource) {
           guest_resource.As(&guest_texture);
         }
-        WriteTextureBmp(paint_device, device_context, guest_texture.Get(), "E:/PinyonShift/work/.local/guest.bmp");
+        char guest_path[256];
+        std::snprintf(guest_path, sizeof(guest_path),
+                      "E:/PinyonShift/work/.local/frames/guest_%06u.bmp", dump_frame);
+        FrameDumpReport guest_report;
+        DumpTextureBmp(paint_device, device_context, guest_texture.Get(), guest_path,
+                       &guest_report);
+        REXLOG_INFO(
+            "D3D11Presenter: guest dump {} {}x{} format {} pitch {} expected {} written {} ({})",
+            guest_path, guest_report.width, guest_report.height, guest_report.format,
+            guest_report.row_pitch, guest_report.bytes_expected, guest_report.bytes_written,
+            guest_report.failure);
       }
       REXLOG_INFO("D3D11Presenter: dumped frame {} ({})", dump_frame, dumped ? "ok" : "failed");
     }

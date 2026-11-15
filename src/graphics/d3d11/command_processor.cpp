@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -1066,6 +1067,14 @@ void D3D11CommandProcessor::UpdateFixedFunctionState(
     bool primitive_polygonal, reg::RB_DEPTHCONTROL normalized_depth_control) {
   ID3D11DeviceContext* context = GetD3D11Provider().GetImmediateContext();
 
+  if (REXCVAR_GET(pinyon_audit_passes)) {
+    const auto& pass_window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    rex::graphics::render_audit::SetDrawGeo(
+        int32_t(pass_window_offset.window_x_offset),
+        int32_t(pass_window_offset.window_y_offset), float(viewport_info.xy_extent[0]),
+        float(viewport_info.xy_extent[1]), float(scissor.offset[0]),
+        float(scissor.offset[1]), float(scissor.extent[0]), float(scissor.extent[1]));
+  }
   D3D11_VIEWPORT viewport;
   viewport.TopLeftX = float(viewport_info.xy_offset[0]);
   viewport.TopLeftY = float(viewport_info.xy_offset[1]);
@@ -2785,6 +2794,9 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
     if (!draw_recorded) {
       context->Draw(primitive_processing_result.host_draw_vertex_count, 0);
+    if (REXCVAR_GET(pinyon_audit_passes)) {
+      rex::graphics::render_audit::NoteDrawSubmission();
+    }
     }
   } else {
     DXGI_FORMAT index_format =
@@ -3791,18 +3803,18 @@ bool D3D11CommandProcessor::IssueCopy() {
           ++trace_logs;
           std::FILE* trace_file = std::fopen("E:/PinyonShift/work/.local/resolve-trace.log", "a");
           if (trace_file) {
-          std::fprintf(trace_file,
-                       "RESOLVE src=%ux%u+%u+%u dest_base=0x%X pitch=%u pack=%u endian=%u swap=%u "
-                       "scale=%u unscaled=%u extent=0x%X len=%u samples=%u\n",
-                       trace_width, trace_height, uint32_t(source.rect.left),
-                       uint32_t(source.rect.top), plan.dest_base, plan.dest_pitch,
-                       plan.dest_info & 7u, (plan.dest_info >> 3u) & 7u,
-                       (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 20u) & 3u,
-                       (plan.dest_info >> 22u) & 1u, plan.info.copy_dest_extent_start,
-                       plan.info.copy_dest_extent_length,
-                       uint32_t(source.surface ? source.surface->samples : 0));
-          std::fflush(trace_file);
-          std::fclose(trace_file);
+            std::fprintf(trace_file,
+                         "RESOLVE src=%ux%u+%u+%u dest_base=0x%X pitch=%u pack=%u endian=%u swap=%u "
+                         "scale=%u unscaled=%u extent=0x%X len=%u samples=%u\n",
+                         trace_width, trace_height, uint32_t(source.rect.left),
+                         uint32_t(source.rect.top), plan.dest_base, plan.dest_pitch,
+                         plan.dest_info & 7u, (plan.dest_info >> 3u) & 7u,
+                         (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 20u) & 3u,
+                         (plan.dest_info >> 22u) & 1u, plan.info.copy_dest_extent_start,
+                         plan.info.copy_dest_extent_length,
+                         uint32_t(source.surface ? source.surface->samples : 0));
+            std::fflush(trace_file);
+            std::fclose(trace_file);
           }
         }
       }
@@ -3819,6 +3831,436 @@ bool D3D11CommandProcessor::IssueCopy() {
     }
   }
   if (complete && use_staging_copy) {
+    // Gate the expensive measurement (WaitForGpu + staging readbacks) to the
+    // pass window: without this it runs on every resolve of a visible run and
+    // chokes the present path black. SetDrawGeo/NoteDrawSubmission above stay
+    // ungated (cheap counters).
+    if (REXCVAR_GET(pinyon_audit_passes) &&
+        rex::graphics::render_audit::PassWindowActive()) {
+      std::vector<uint32_t> pass_src_rows;
+      std::vector<uint32_t> pass_dst_rows;
+      uint32_t pass_src_w = 0, pass_src_h = 0;
+      WaitForGpu();
+      ID3D11Device* pass_device = GetD3D11Provider().GetDevice();
+      ID3D11DeviceContext* pass_context = GetD3D11Provider().GetImmediateContext();
+      if (source.surface && source.surface->texture) {
+        D3D11_TEXTURE2D_DESC pass_desc;
+        source.surface->texture->GetDesc(&pass_desc);
+        pass_src_w = pass_desc.Width;
+        pass_src_h = pass_desc.Height;
+        // A multi-sample texture cannot be mapped as a 2D staging surface, so
+        // occupancy is only measured for single-sample sources and the record
+        // says so with an empty tally.
+        if (source.surface->samples == 1) {
+          D3D11_TEXTURE2D_DESC pass_staging = pass_desc;
+          pass_staging.Usage = D3D11_USAGE_STAGING;
+          pass_staging.BindFlags = 0;
+          pass_staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+          pass_staging.MiscFlags = 0;
+          Microsoft::WRL::ComPtr<ID3D11Texture2D> pass_readback;
+          if (SUCCEEDED(pass_device->CreateTexture2D(&pass_staging, nullptr, &pass_readback))) {
+            pass_context->CopyResource(pass_readback.Get(), source.surface->texture);
+            D3D11_MAPPED_SUBRESOURCE pass_mapped;
+            if (SUCCEEDED(pass_context->Map(pass_readback.Get(), 0, D3D11_MAP_READ, 0,
+                                           &pass_mapped))) {
+              const uint32_t pass_bottom =
+                  std::min<uint32_t>(pass_desc.Height, uint32_t(std::max<int32_t>(plan.y1, 0)));
+              for (uint32_t pass_y = 0; pass_y < pass_bottom; pass_y += 16) {
+                const uint32_t* pass_texels = reinterpret_cast<const uint32_t*>(
+                    static_cast<const uint8_t*>(pass_mapped.pData) +
+                    size_t(pass_mapped.RowPitch) * pass_y);
+                uint32_t pass_nonzero = 0;
+                for (uint32_t pass_x = 0; pass_x < pass_desc.Width; pass_x += 32) {
+                  pass_nonzero += pass_texels[pass_x] != 0;
+                }
+                pass_src_rows.push_back(pass_nonzero);
+              }
+              pass_context->Unmap(pass_readback.Get(), 0);
+            }
+          }
+        }
+      }
+      // Destination coverage: which 16-row bands of the resolve output hold
+      // non-zero words right after this dispatch.
+      resolve_readback_scratch_.resize(plan.info.copy_dest_extent_length);
+      if (upload_sink->ReadbackResolveStaging(0, resolve_readback_scratch_.data(),
+                                             plan.info.copy_dest_extent_length)) {
+        const uint32_t pass_row_words = plan.dest_pitch ? plan.dest_pitch / 4u : 0u;
+        const uint8_t* pass_bytes = resolve_readback_scratch_.data();
+        if (pass_row_words) {
+          const uint32_t pass_words =
+              uint32_t(plan.info.copy_dest_extent_length / 4u);
+          const uint32_t pass_rows = pass_words / pass_row_words;
+          for (uint32_t pass_y = 0; pass_y < pass_rows; pass_y += 16) {
+            uint32_t pass_nonzero = 0;
+            const uint32_t pass_row_end = std::min<uint32_t>(pass_rows, pass_y + 16);
+            for (uint32_t pass_row = pass_y; pass_row < pass_row_end; ++pass_row) {
+              for (uint32_t pass_x = 0; pass_x < pass_row_words; pass_x += 8) {
+                const uint32_t pass_word = *reinterpret_cast<const uint32_t*>(
+                    pass_bytes + (size_t(pass_row) * pass_row_words + pass_x) * 4u);
+                pass_nonzero += pass_word != 0;
+              }
+            }
+            pass_dst_rows.push_back(pass_nonzero);
+          }
+        }
+      }
+      // A multisampled resource cannot be a staging resource and cannot be
+      // mapped. The chain D3D11 requires is: 4x DEFAULT source -> 1x DEFAULT
+      // destination (ResolveSubresource needs a single-sampled DEFAULT
+      // destination) -> staging -> event query -> Map. Every step is recorded,
+      // so a zero reading can be told apart from a broken measurement.
+      std::vector<uint32_t> pass_hw_rows;
+      const char* pass_evidence = "none";
+      if (source.surface && source.surface->texture) {
+        if (source.surface->samples == 1) {
+          pass_evidence = "raw_map";
+        } else if (REXCVAR_GET(pinyon_msaa_probe)) {
+          rex::graphics::render_audit::ProbeInfo probe;
+          probe.label = "production_4x_source";
+          probe.reason = "hardware_resolve_chain";
+          D3D11_TEXTURE2D_DESC probe_src{};
+          source.surface->texture->GetDesc(&probe_src);
+          probe.resource_format = uint32_t(probe_src.Format);
+          probe.samples = probe_src.SampleDesc.Count;
+          probe.quality = probe_src.SampleDesc.Quality;
+          probe.bind_flags = probe_src.BindFlags;
+          probe.create_src = 0;
+          UINT probe_support = 0;
+          if (SUCCEEDED(pass_device->CheckFormatSupport(probe_src.Format, &probe_support))) {
+            probe.support_ms_load =
+                (probe_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD) ? 1u : 0u;
+            probe.support_ms_resolve =
+                (probe_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE) ? 1u : 0u;
+          }
+          if (probe_support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC probe_srv_desc{};
+            probe_srv_desc.Format = probe_src.Format;
+            probe_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> probe_srv;
+            probe.create_srv =
+                int32_t(pass_device->CreateShaderResourceView(source.surface->texture,
+                                                              &probe_srv_desc, &probe_srv));
+            probe.srv_view_format = uint32_t(probe_srv_desc.Format);
+          } else {
+            probe.create_srv = int32_t(E_INVALIDARG);
+          }
+          uint32_t probe_max = 0;
+          uint32_t probe_nonzero = 0;
+          if (probe.support_ms_resolve) {
+            D3D11_TEXTURE2D_DESC probe_dst_desc = probe_src;
+            probe_dst_desc.SampleDesc.Count = 1;
+            probe_dst_desc.SampleDesc.Quality = 0;
+            probe_dst_desc.Usage = D3D11_USAGE_DEFAULT;
+            probe_dst_desc.BindFlags = 0;
+            probe_dst_desc.CPUAccessFlags = 0;
+            probe_dst_desc.MiscFlags = 0;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> probe_dst;
+            probe.create_dst = int32_t(pass_device->CreateTexture2D(&probe_dst_desc, nullptr,
+                                                                    &probe_dst));
+            D3D11_TEXTURE2D_DESC probe_staging_desc = probe_dst_desc;
+            probe_staging_desc.Usage = D3D11_USAGE_STAGING;
+            probe_staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> probe_staging;
+            if (SUCCEEDED(probe.create_dst)) {
+              probe.create_staging =
+                  int32_t(pass_device->CreateTexture2D(&probe_staging_desc, nullptr,
+                                                       &probe_staging));
+            }
+            if (SUCCEEDED(probe.create_dst) && SUCCEEDED(probe.create_staging)) {
+              pass_context->ResolveSubresource(probe_dst.Get(), 0, source.surface->texture, 0,
+                                               probe_dst_desc.Format);
+              probe.copy_stage = 1;
+              pass_context->CopyResource(probe_staging.Get(), probe_dst.Get());
+              D3D11_QUERY_DESC probe_query_desc{};
+              probe_query_desc.Query = D3D11_QUERY_EVENT;
+              Microsoft::WRL::ComPtr<ID3D11Query> probe_query;
+              probe.query_status = 1;
+              if (SUCCEEDED(pass_device->CreateQuery(&probe_query_desc, &probe_query))) {
+                pass_context->End(probe_query.Get());
+                pass_context->Flush();
+                for (int probe_spin = 0; probe_spin < 60; ++probe_spin) {
+                  const HRESULT probe_poll = pass_context->GetData(probe_query.Get(), nullptr, 0, 0);
+                  if (probe_poll == S_OK) {
+                    probe.query_status = 0;
+                    break;
+                  }
+                  if (probe_poll != S_FALSE) {
+                    probe.query_status = 2;
+                    break;
+                  }
+                  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+              }
+              if (probe.query_status == 0) {
+                D3D11_MAPPED_SUBRESOURCE probe_mapped{};
+                probe.map_hresult = int32_t(pass_context->Map(probe_staging.Get(), 0,
+                                                              D3D11_MAP_READ, 0, &probe_mapped));
+                if (SUCCEEDED(probe.map_hresult)) {
+                  probe.map_row_pitch = probe_mapped.RowPitch;
+                  for (uint32_t probe_row = 0; probe_row < probe_staging_desc.Height;
+                       probe_row += 16) {
+                    const uint32_t* probe_texels = reinterpret_cast<const uint32_t*>(
+                        static_cast<const uint8_t*>(probe_mapped.pData) +
+                        size_t(probe_mapped.RowPitch) * probe_row);
+                    uint32_t probe_row_nonzero = 0;
+                    for (uint32_t probe_col = 0; probe_col < probe_staging_desc.Width;
+                         probe_col += 32) {
+                      const uint32_t probe_texel = probe_texels[probe_col];
+                      probe_row_nonzero += probe_texel != 0;
+                      if (probe_texel != 0) {
+                        probe_max = std::max(probe_max, probe_texel);
+                      }
+                      ++probe.sampled_pixels;
+                    }
+                    probe_nonzero += probe_row_nonzero;
+                    pass_hw_rows.push_back(probe_row_nonzero);
+                  }
+                  probe.uav_copied = probe_mapped.RowPitch * probe_staging_desc.Height;
+                  probe.uav_expected = probe.uav_copied;
+                  probe.uav_stride = 4;
+                  probe.uav_byte_width = probe_staging_desc.Width * 4;
+                  probe.record_complete = true;
+                  pass_evidence = "hw_resolve";
+                }
+                pass_context->Unmap(probe_staging.Get(), 0);
+              }
+            }
+          }
+          probe.sample_rows[0] = probe_nonzero;
+          probe.max_r = probe_max;
+          probe.max_g = probe_max;
+          probe.max_b = probe_max;
+          probe.max_a = probe_max;
+          if (!probe.record_complete) {
+            probe.verdict = "invalid_measurement";
+            probe.reason = probe.support_ms_resolve ? "query_or_map_failed"
+                                                    : "no_hardware_resolve_support";
+          } else if (probe_nonzero == 0) {
+            probe.verdict = "valid";
+            probe.reason = "zero_in_sampled_coordinates";
+          } else {
+            probe.verdict = "valid";
+            probe.reason = "nonzero_in_sampled_coordinates";
+          }
+          rex::graphics::render_audit::NoteProbe(probe);
+        }
+      }
+      // All-owner provenance: the production probe above only measures the
+      // one surface the copy names. If the resolve rect mixes owners, the
+      // pixels may live under a different owner, so enumerate every owner
+      // intersecting this rect and probe each one's surface the same way.
+      // Decision table: selected owner empty + another owner populated =
+      // source selection; all owners empty = draw population / target
+      // binding; selected owner populated + hardware resolve empty =
+      // resolve coordinates / sample selection.
+      if (REXCVAR_GET(pinyon_msaa_probe) && native_executor_) {
+        const std::map<uint32_t, uint32_t> owners = native_executor_->EnumerateResolveOwners(
+            plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1);
+        for (const auto& owner_entry : owners) {
+          const uint32_t owner_key = owner_entry.first;
+          const uint32_t owner_tiles = owner_entry.second;
+          if (owner_key == Fh1EdramTiles::kNoOwner) {
+            continue;
+          }
+          D3D11Fh1NativeSurface* owner_surface = nullptr;
+          if (native_surfaces_) {
+            owner_surface = native_surfaces_->FindSurface(owner_key);
+          }
+          char owner_label[96];
+          std::snprintf(owner_label, sizeof(owner_label), "owner_%08X_tiles_%u", owner_key,
+                        owner_tiles);
+          rex::graphics::render_audit::ProbeInfo owner_probe;
+          owner_probe.label = owner_label;
+          owner_probe.reason = "all_owner_provenance";
+          if (!owner_surface || !owner_surface->texture) {
+            owner_probe.verdict = "invalid_measurement";
+            owner_probe.reason = "no_surface_for_owner";
+            rex::graphics::render_audit::NoteProbe(owner_probe);
+            continue;
+          }
+          if (owner_surface == source.surface) {
+            // Already probed as the production source above.
+            continue;
+          }
+          D3D11_TEXTURE2D_DESC owner_desc{};
+          owner_surface->texture->GetDesc(&owner_desc);
+          owner_probe.resource_format = uint32_t(owner_desc.Format);
+          owner_probe.samples = owner_desc.SampleDesc.Count;
+          owner_probe.quality = owner_desc.SampleDesc.Quality;
+          owner_probe.bind_flags = owner_desc.BindFlags;
+          owner_probe.create_src = 0;
+          UINT owner_support = 0;
+          if (SUCCEEDED(pass_device->CheckFormatSupport(owner_desc.Format, &owner_support))) {
+            owner_probe.support_ms_load =
+                (owner_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_LOAD) ? 1u : 0u;
+            owner_probe.support_ms_resolve =
+                (owner_support & D3D11_FORMAT_SUPPORT_MULTISAMPLE_RESOLVE) ? 1u : 0u;
+          }
+          uint32_t owner_nonzero = 0;
+          uint32_t owner_max = 0;
+          if (owner_surface->samples == 1) {
+            owner_probe.reason = "raw_map";
+            D3D11_TEXTURE2D_DESC owner_staging = owner_desc;
+            owner_staging.Usage = D3D11_USAGE_STAGING;
+            owner_staging.BindFlags = 0;
+            owner_staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            owner_staging.MiscFlags = 0;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> owner_readback;
+            owner_probe.create_staging =
+                int32_t(pass_device->CreateTexture2D(&owner_staging, nullptr, &owner_readback));
+            if (SUCCEEDED(owner_probe.create_staging)) {
+              pass_context->CopyResource(owner_readback.Get(), owner_surface->texture);
+              D3D11_QUERY_DESC owner_query_desc{};
+              owner_query_desc.Query = D3D11_QUERY_EVENT;
+              Microsoft::WRL::ComPtr<ID3D11Query> owner_query;
+              owner_probe.query_status = 1;
+              if (SUCCEEDED(pass_device->CreateQuery(&owner_query_desc, &owner_query))) {
+                pass_context->End(owner_query.Get());
+                pass_context->Flush();
+                for (int owner_spin = 0; owner_spin < 60; ++owner_spin) {
+                  const HRESULT owner_poll =
+                      pass_context->GetData(owner_query.Get(), nullptr, 0, 0);
+                  if (owner_poll == S_OK) {
+                    owner_probe.query_status = 0;
+                    break;
+                  }
+                  if (owner_poll != S_FALSE) {
+                    owner_probe.query_status = 2;
+                    break;
+                  }
+                  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+              }
+              if (owner_probe.query_status == 0) {
+                D3D11_MAPPED_SUBRESOURCE owner_mapped{};
+                owner_probe.map_hresult = int32_t(pass_context->Map(
+                    owner_readback.Get(), 0, D3D11_MAP_READ, 0, &owner_mapped));
+                if (SUCCEEDED(owner_probe.map_hresult)) {
+                  owner_probe.map_row_pitch = owner_mapped.RowPitch;
+                  for (uint32_t owner_row = 0; owner_row < owner_desc.Height;
+                       owner_row += 16) {
+                    const uint32_t* owner_texels = reinterpret_cast<const uint32_t*>(
+                        static_cast<const uint8_t*>(owner_mapped.pData) +
+                        size_t(owner_mapped.RowPitch) * owner_row);
+                    uint32_t owner_row_nonzero = 0;
+                    for (uint32_t owner_col = 0; owner_col < owner_desc.Width;
+                         owner_col += 32) {
+                      const uint32_t owner_texel = owner_texels[owner_col];
+                      owner_row_nonzero += owner_texel != 0;
+                      if (owner_texel != 0) {
+                        owner_max = std::max(owner_max, owner_texel);
+                      }
+                      ++owner_probe.sampled_pixels;
+                    }
+                    owner_nonzero += owner_row_nonzero;
+                  }
+                  owner_probe.record_complete = true;
+                  pass_context->Unmap(owner_readback.Get(), 0);
+                }
+              }
+            }
+          } else if (owner_probe.support_ms_resolve) {
+            owner_probe.reason = "hardware_resolve_chain";
+            D3D11_TEXTURE2D_DESC owner_dst_desc = owner_desc;
+            owner_dst_desc.SampleDesc.Count = 1;
+            owner_dst_desc.SampleDesc.Quality = 0;
+            owner_dst_desc.Usage = D3D11_USAGE_DEFAULT;
+            owner_dst_desc.BindFlags = 0;
+            owner_dst_desc.CPUAccessFlags = 0;
+            owner_dst_desc.MiscFlags = 0;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> owner_dst;
+            owner_probe.create_dst = int32_t(
+                pass_device->CreateTexture2D(&owner_dst_desc, nullptr, &owner_dst));
+            D3D11_TEXTURE2D_DESC owner_staging_desc = owner_dst_desc;
+            owner_staging_desc.Usage = D3D11_USAGE_STAGING;
+            owner_staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> owner_staging;
+            if (SUCCEEDED(owner_probe.create_dst)) {
+              owner_probe.create_staging = int32_t(pass_device->CreateTexture2D(
+                  &owner_staging_desc, nullptr, &owner_staging));
+            }
+            if (SUCCEEDED(owner_probe.create_dst) && SUCCEEDED(owner_probe.create_staging)) {
+              pass_context->ResolveSubresource(owner_dst.Get(), 0, owner_surface->texture, 0,
+                                               owner_dst_desc.Format);
+              owner_probe.copy_stage = 1;
+              pass_context->CopyResource(owner_staging.Get(), owner_dst.Get());
+              D3D11_QUERY_DESC owner_query_desc{};
+              owner_query_desc.Query = D3D11_QUERY_EVENT;
+              Microsoft::WRL::ComPtr<ID3D11Query> owner_query;
+              owner_probe.query_status = 1;
+              if (SUCCEEDED(pass_device->CreateQuery(&owner_query_desc, &owner_query))) {
+                pass_context->End(owner_query.Get());
+                pass_context->Flush();
+                for (int owner_spin = 0; owner_spin < 60; ++owner_spin) {
+                  const HRESULT owner_poll =
+                      pass_context->GetData(owner_query.Get(), nullptr, 0, 0);
+                  if (owner_poll == S_OK) {
+                    owner_probe.query_status = 0;
+                    break;
+                  }
+                  if (owner_poll != S_FALSE) {
+                    owner_probe.query_status = 2;
+                    break;
+                  }
+                  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+              }
+              if (owner_probe.query_status == 0) {
+                D3D11_MAPPED_SUBRESOURCE owner_mapped{};
+                owner_probe.map_hresult = int32_t(pass_context->Map(
+                    owner_staging.Get(), 0, D3D11_MAP_READ, 0, &owner_mapped));
+                if (SUCCEEDED(owner_probe.map_hresult)) {
+                  owner_probe.map_row_pitch = owner_mapped.RowPitch;
+                  for (uint32_t owner_row = 0; owner_row < owner_staging_desc.Height;
+                       owner_row += 16) {
+                    const uint32_t* owner_texels = reinterpret_cast<const uint32_t*>(
+                        static_cast<const uint8_t*>(owner_mapped.pData) +
+                        size_t(owner_mapped.RowPitch) * owner_row);
+                    uint32_t owner_row_nonzero = 0;
+                    for (uint32_t owner_col = 0; owner_col < owner_staging_desc.Width;
+                         owner_col += 32) {
+                      const uint32_t owner_texel = owner_texels[owner_col];
+                      owner_row_nonzero += owner_texel != 0;
+                      if (owner_texel != 0) {
+                        owner_max = std::max(owner_max, owner_texel);
+                      }
+                      ++owner_probe.sampled_pixels;
+                    }
+                    owner_nonzero += owner_row_nonzero;
+                  }
+                  owner_probe.record_complete = true;
+                  pass_context->Unmap(owner_staging.Get(), 0);
+                }
+              }
+            }
+          }
+          owner_probe.sample_rows[0] = owner_nonzero;
+          owner_probe.max_r = owner_max;
+          owner_probe.max_g = owner_max;
+          owner_probe.max_b = owner_max;
+          owner_probe.max_a = owner_max;
+          if (!owner_probe.record_complete) {
+            owner_probe.verdict = "invalid_measurement";
+            owner_probe.reason = owner_probe.support_ms_resolve ? "query_or_map_failed"
+                                                                : "no_hardware_resolve_support";
+          } else if (owner_nonzero == 0) {
+            owner_probe.verdict = "valid";
+            owner_probe.reason = "zero_in_sampled_coordinates";
+          } else {
+            owner_probe.verdict = "valid";
+            owner_probe.reason = "nonzero_in_sampled_coordinates";
+          }
+          rex::graphics::render_audit::NoteProbe(owner_probe);
+        }
+      }
+      rex::graphics::render_audit::NotePassResolve(
+          plan.kind.c_str(), plan.x0, plan.y0, plan.x1, plan.y1,
+          plan.resolve_key.Describe().c_str(), pass_src_w, pass_src_h,
+          uint32_t(source.surface ? source.surface->samples : 0), plan.sample_select,
+          plan.dest_base, plan.dest_pitch, plan.dest_info, pass_src_rows, pass_evidence,
+          pass_hw_rows, pass_dst_rows);
+    }
     // The staging readback is the direct measurement of "did the dispatch
     // write the resolved pixels", independent of the copy into the mirror.
     // The first 64 resolves of the session are logged whatever their extent,
@@ -4204,10 +4646,16 @@ bool D3D11CommandProcessor::WaitForGpu() {
 
 void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
-  if (REXCVAR_GET(pinyon_audit)) {
+  // The frame counter must advance for any capture that needs it, not just the
+  // JSONL audit: the pass trace and the probe are both gated on frame id.
+  if (REXCVAR_GET(pinyon_audit) || REXCVAR_GET(pinyon_audit_passes) ||
+      REXCVAR_GET(pinyon_transition_log)) {
     rex::graphics::render_audit::SetContext("d3d11", "GTX 570", 1280, 720);
     rex::graphics::render_audit::EnsureStarted();
-    rex::graphics::render_audit::EndFrame();
+    rex::graphics::render_audit::SetFrameWindow(
+        int32_t(REXCVAR_GET(pinyon_audit_passes_from)),
+        int32_t(REXCVAR_GET(pinyon_audit_passes_to)));
+    rex::graphics::render_audit::EndFrame(REXCVAR_GET(pinyon_transition_log));
   }
   // Phase 3 M2: the swap boundary flushes any recorded resolve work before the
   // swap's readback, surface dump or untiling upload reads GPU results. With
