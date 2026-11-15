@@ -199,7 +199,8 @@ class D3D11CommandProcessor : public CommandProcessor {
   // immediate, so holding the batch until the swap would run it after them and
   // change the order the A/B measurements compare (the frame-boundary
   // submission lands with M3/M4, when draws and the queue join the tape).
-  bool RecordResolveBatch(const Fh1ResolvePlan& plan, D3D11Fh1NativeSurface* source_surface,
+  bool RecordResolveBatch(const Fh1ResolvePlan& plan,
+                          const D3D11Fh1NativeResolve::SourceRect& source,
                           ID3D11UnorderedAccessView* memory_target, bool use_staging_copy);
   bool RecordResolveStagingCopy(uint32_t host_offset, uint32_t length);
   bool SubmitFrameTape(const char* reason);

@@ -59,16 +59,33 @@ inline uint32_t Fh1D3D11SurfaceWidth(const Fh1SurfaceKey& key) {
   return key.pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2);
 }
 
+inline uint32_t Fh1D3D11SurfaceTilePitch(const Fh1SurfaceKey& key) {
+  return key.pitch_tiles << uint32_t(key.Is64bpp());
+}
+
+inline uint32_t Fh1D3D11SurfaceTileWidth(const Fh1SurfaceKey& key) {
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  return (xenos::kEdramTileWidthSamples >> msaa_x_log2) >> uint32_t(key.Is64bpp());
+}
+
 // The surface height in guest pixels (fh1_edram_surfaces.h clamps it to the
 // guest texture size limit and to the host texture size at the scale).
 inline uint32_t Fh1D3D11SurfaceHeight(const Fh1SurfaceKey& key, uint32_t scale) {
-  return Fh1SurfaceHeight(key.pitch_tiles, key.msaa, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, scale);
+  return Fh1SurfaceHeight(Fh1D3D11SurfaceTilePitch(key), key.msaa,
+                          D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, scale);
 }
 
 // Host sample count for a guest sample mode - 2x via 4x (top-left and
 // bottom-right samples) where the host has no 2x MSAA.
 inline uint32_t Fh1D3D11SurfaceSamples(uint32_t msaa, bool msaa_2x_supported) {
   return msaa == uint32_t(xenos::MsaaSamples::k2X) && !msaa_2x_supported ? 4 : 1u << msaa;
+}
+
+// When guest 2x MSAA is emulated with a 4x host surface, only the top-left
+// and bottom-right samples represent guest samples.
+inline uint32_t Fh1D3D11SampleMask(const Fh1SurfaceKey& key, uint32_t host_samples) {
+  return key.msaa == uint32_t(xenos::MsaaSamples::k2X) && host_samples == 4 ? 0b1001u
+                                                                            : ~uint32_t(0);
 }
 
 // EDRAM surface keys -> native render targets, cleared to zero on creation

@@ -3018,15 +3018,14 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 // incompatible view is bound (the resolve blanking defect), so the batch starts
 // with the explicit unbind the immediate path performs inline.
 bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
-                                               D3D11Fh1NativeSurface* source_surface,
+                                               const D3D11Fh1NativeResolve::SourceRect& source_rect,
                                                ID3D11UnorderedAccessView* memory_target,
                                                bool use_staging_copy) {
-  if (!command_lists_enabled_ || !command_list_ || !native_resolve_ || !source_surface) {
+  if (!command_lists_enabled_ || !command_list_ || !native_resolve_ || !source_rect.surface) {
     return false;
   }
   D3D11CommandList& tape = *command_list_;
-  D3D11Fh1NativeResolve::SourceRect source;
-  source.surface = source_surface;
+  const D3D11Fh1NativeResolve::SourceRect& source = source_rect;
   // MSAA-safe provenance readback: ResolveSubresource copies the 4x colour
   // surface to a temporary 1x texture without touching the live render path,
   // then staging reads precisely rows 0..255 for this resolve's source.
@@ -3077,7 +3076,6 @@ bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
       }
     }
   }
-  source.rect = {plan.x0, plan.y0, plan.x1, plan.y1};
   const uint32_t resolve_dest_base =
       use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
   auto append_batch = [&]() -> bool {
@@ -3086,7 +3084,7 @@ bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
       return false;
     }
     if (resource_state_tracker_) {
-      resource_state_tracker_->Transition(tape, source_surface->texture,
+      resource_state_tracker_->Transition(tape, source.surface->texture,
                                           D3D11ResourceState::kShaderResource);
     }
     Microsoft::WRL::ComPtr<ID3D11Resource> target_resource;
@@ -3560,8 +3558,35 @@ bool D3D11CommandProcessor::IssueCopy() {
     // Nothing to copy or clear: Xenos does no work either.
     return plan.empty;
   }
-  // Bounded resolve-clear evidence for one selected presented frame. This is
-  // intentionally log-only: D3D11 does not execute the clear here yet.
+  const bool resolve_clear_requested =
+      plan.info.IsClearingColor() || plan.info.IsClearingDepth();
+  auto apply_resolve_clears = [&]() {
+    if (!resolve_clear_requested) return true;
+    if (!native_executor_) {
+      REXGPU_ERROR("D3D11 FH1 native resolve: resolve clear requested without a native executor");
+      return false;
+    }
+    // Clears execute on the immediate context. Submit any queued draws (and
+    // resolve dispatches) first so the clear remains after the guest's copy.
+    if (command_lists_enabled_ && !SubmitFrameTape("resolve clear ordering")) return false;
+    bool succeeded = true;
+    if (plan.info.IsClearingColor()) {
+      succeeded &= native_executor_->ResolveClear(
+          Fh1SurfaceKey::Color(plan.color_info.color_base, plan.pitch_tiles, plan.msaa,
+                               plan.color_info.color_format,
+                               host_render_config_->gamma_render_target_as_unorm16()),
+          plan.x0, plan.y0, plan.x1, plan.y1, plan.info.rb_color_clear,
+          plan.info.rb_color_clear_lo);
+    }
+    if (plan.info.IsClearingDepth()) {
+      succeeded &= native_executor_->ResolveClear(
+          Fh1SurfaceKey::Depth(plan.depth_info.depth_base, plan.pitch_tiles, plan.msaa,
+                               plan.depth_info.depth_format),
+          plan.x0, plan.y0, plan.x1, plan.y1, plan.info.rb_depth_clear, 0);
+    }
+    return succeeded;
+  };
+  // Bounded resolve-clear evidence for one selected presented frame.
   const int32_t clear_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
   if (!plan.empty && clear_trace_swap > 0 &&
       presented_output_frames_ == uint64_t(clear_trace_swap)) {
@@ -3588,25 +3613,8 @@ bool D3D11CommandProcessor::IssueCopy() {
           plan.info.rb_color_clear_lo, plan.info.rb_depth_clear);
     }
   }
-  // D3D11 resolve-time clears have the same semantics as the D3D12 and Vulkan
-  // executors: the guest clears the EDRAM tiles at the resolve rectangle and the
-  // native surface must be cleared to match before the next pass reads it.
   if (!plan.copy) {
-    if (plan.info.IsClearingColor()) {
-      if (native_executor_) {
-        native_executor_->ResolveClear(Fh1SurfaceKey::Color(plan.color_info.color_base, plan.pitch_tiles, plan.msaa, plan.color_info.color_format, host_render_config_->gamma_render_target_as_unorm16()),
-                                      plan.x0, plan.y0, plan.x1, plan.y1,
-                                      plan.info.rb_color_clear,
-                                      plan.info.rb_color_clear_lo);
-      }
-    }
-    if (plan.info.IsClearingDepth()) {
-      if (native_executor_) {
-        native_executor_->ResolveClear(Fh1SurfaceKey::Depth(plan.depth_info.depth_base, plan.pitch_tiles, plan.msaa, plan.depth_info.depth_format),
-                                      plan.x0, plan.y0, plan.x1, plan.y1,
-                                      plan.info.rb_depth_clear, 0);
-      }
-    }
+    apply_resolve_clears();
     REXGPU_WARN("D3D11 FH1 native resolve: skipped ({})", plan.skip ? plan.skip : "unknown");
     return false;
   }
@@ -3689,25 +3697,42 @@ bool D3D11CommandProcessor::IssueCopy() {
     binding_context->PSSetShaderResources(0, 1, &no_shared_memory_view);
   }
   D3D11Fh1NativeResolve::SourceRect source;
+  source.rect = {plan.x0, plan.y0, plan.x1, plan.y1};
+  std::vector<D3D11Fh1NativeResolve::SourceRect> resolve_sources;
   const size_t surfaces_before = native_surfaces_->surface_count();
   const bool resolve_owner_was_draw_target =
       ever_bound_render_target_keys_.count(plan.resolve_key.Pack()) != 0;
-  // Phase 2 C1: read the surface the draws filled. The tiles under the copy's
-  // rectangle were claimed by the surface the draws bound, whose key can differ
-  // from the one the copy names - a storage format for a guest format, or a
-  // format switch between passes on the same EDRAM. The words are the same
-  // words: the resolve shader decodes them through the copy's format and takes
-  // the sampling layout from the owner (its two layout words), so the owner is
-  // the correct source. Without a single owner the copy's own key is used, as
-  // before (and that surface is created zero-cleared on demand).
+  // Split using the same tile geometry and owner table as D3D12/Vulkan. Each
+  // dispatch keeps its source and destination pixel coordinates, so a change
+  // of owner in the middle of the copy cannot make one surface supply stale
+  // pixels for another owner's tiles.
   D3D11Fh1NativeSurface* source_by_owner = nullptr;
   if (native_executor_) {
-    const uint32_t source_owner = native_executor_->ResolveSourceOwner(
-        plan.resolve_key, plan.x0, plan.y0, plan.x1, plan.y1);
-    if (source_owner != Fh1EdramTiles::kNoOwner &&
-        source_owner != plan.resolve_key.Pack()) {
-      source_by_owner = native_surfaces_->FindSurface(source_owner);
+    const uint32_t tile_width = Fh1D3D11SurfaceTileWidth(plan.resolve_key);
+    const uint32_t tile_height =
+        xenos::kEdramTileHeightSamples >>
+        uint32_t(plan.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+    const uint32_t tile_pitch = Fh1D3D11SurfaceTilePitch(plan.resolve_key);
+    for (const Fh1EdramTiles::OwnerRect& rect :
+         native_executor_->tiles().SplitByOwner(plan.resolve_key.base_tiles, tile_pitch,
+                                                int32_t(tile_width), int32_t(tile_height),
+                                                plan.x0, plan.y0, plan.x1, plan.y1)) {
+      D3D11Fh1NativeResolve::SourceRect region;
+      region.rect = {rect.left, rect.top, rect.right, rect.bottom};
+      if (rect.owner != Fh1EdramTiles::kNoOwner) {
+        region.surface = native_surfaces_->FindSurface(rect.owner);
+        if (!source_by_owner && region.surface &&
+            rect.owner != plan.resolve_key.Pack()) {
+          source_by_owner = region.surface;
+        }
+      }
+      resolve_sources.push_back(region);
     }
+  } else {
+    D3D11Fh1NativeResolve::SourceRect region;
+    region.surface = native_surfaces_->GetOrCreateSurface(plan.resolve_key);
+    region.rect = source.rect;
+    resolve_sources.push_back(region);
   }
   source.surface = source_by_owner ? source_by_owner
                                    : native_surfaces_->GetOrCreateSurface(plan.resolve_key);
@@ -3809,7 +3834,6 @@ bool D3D11CommandProcessor::IssueCopy() {
       }
     }
   }
-  source.rect = {plan.x0, plan.y0, plan.x1, plan.y1};
   // fh1_debug_resolve_trace (PHASE 12): the frame's own producer record. A
   // guest range can hold more than one texture over one frame (a pool the game
   // reuses - a 640x360 colour target, a 320x192 one and a 520x520 shadow map
@@ -3890,8 +3914,9 @@ bool D3D11CommandProcessor::IssueCopy() {
           resolve_call_count_, plan.resolve_key.Describe(), plan.x0, plan.y0, plan.x1, plan.y1,
           plan.dest_base, plan.dest_pitch, plan.dest_info & 7u, plan.info.copy_dest_extent_start,
           plan.info.copy_dest_extent_length, alias_bytes, uint32_t(alias_base));
+      const bool clear_ok = apply_resolve_clears();
       ++resolve_call_count_;
-      return true;
+      return clear_ok;
     }
   }
   // fh1_swap_fetch_trace: does this resolve's dispatch change the GPU mirror
@@ -3951,14 +3976,25 @@ bool D3D11CommandProcessor::IssueCopy() {
   const bool capture_minimap_frame = minimap_swap > 0 &&
                                      presented_output_frames_ == uint64_t(minimap_swap);
   bool complete = false;
+  bool any_resolved = false;
   if (source.rect.left < source.rect.right && source.rect.top < source.rect.bottom) {
     if (command_lists_enabled_) {
       // Phase 3 M2: the same plan, recorded as a packet batch and replayed
       // through the tape's immediate sink before the diagnostics below read
       // GPU output - the recorded stream is the immediate stream in order.
-      complete = RecordResolveBatch(plan, source.surface, memory_target, use_staging_copy);
-      if (complete) {
-        SubmitFrameTape("resolve dispatch");
+      complete = !resolve_sources.empty();
+      for (const D3D11Fh1NativeResolve::SourceRect& region : resolve_sources) {
+        if (!region.surface) {
+          complete = false;
+          continue;
+        }
+        const bool recorded =
+            RecordResolveBatch(plan, region, memory_target, use_staging_copy);
+        any_resolved |= recorded;
+        complete &= recorded;
+      }
+      if (any_resolved) {
+        complete &= SubmitFrameTape("resolve dispatch");
       }
     } else {
       if (capture_minimap_frame && !plan.copying_depth && source.surface && source.surface->texture &&
@@ -4059,12 +4095,21 @@ bool D3D11CommandProcessor::IssueCopy() {
             uint32_t(source.surface ? source.surface->samples : 0), plan.dest_info & 7u,
             (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 22u) & 1u);
       }
-      complete = native_resolve_->ResolveToMemory(source, plan.resolve_key, plan.sample_select,
-                                                  plan.dest_info, resolve_dest_base,
-                                                  plan.dest_pitch, memory_target, true);
+      complete = !resolve_sources.empty();
+      for (const D3D11Fh1NativeResolve::SourceRect& region : resolve_sources) {
+        if (!region.surface) {
+          complete = false;
+          continue;
+        }
+        const bool resolved = native_resolve_->ResolveToMemory(
+            region, plan.resolve_key, plan.sample_select, plan.dest_info, resolve_dest_base,
+            plan.dest_pitch, memory_target, true);
+        any_resolved |= resolved;
+        complete &= resolved;
+      }
     }
   }
-  if (complete && use_staging_copy) {
+  if ((complete || any_resolved) && use_staging_copy) {
     const bool capture_minimap_candidate = capture_minimap_frame && !plan.copying_depth &&
         plan.x1 - plan.x0 >= 256 && plan.x1 - plan.x0 <= 512 &&
         plan.y1 - plan.y0 >= 128 && plan.y1 - plan.y0 <= 256 && source.surface &&
@@ -4745,6 +4790,7 @@ bool D3D11CommandProcessor::IssueCopy() {
             : upload_sink->CopyResolveStagingToHost(plan.info.copy_dest_extent_start,
                                                     plan.info.copy_dest_extent_length);
     if (!staging_copy_ok) {
+      complete = false;
       static bool staging_copy_failed_logged = false;
       if (!staging_copy_failed_logged) {
         staging_copy_failed_logged = true;
@@ -4837,8 +4883,12 @@ bool D3D11CommandProcessor::IssueCopy() {
         after_hash, after_nonzero, after_ok, after_hash != mirror_before_hash, probe_hash,
         probe_nonzero);
   }
-  texture_cache_->MarkRangeAsResolved(plan.info.copy_dest_extent_start,
-                                      plan.info.copy_dest_extent_length);
+  const bool resolve_complete = complete;
+  complete &= apply_resolve_clears();
+  if (resolve_complete && !small_uav_probe && window_probe_mb <= 0) {
+    texture_cache_->MarkRangeAsResolved(plan.info.copy_dest_extent_start,
+                                        plan.info.copy_dest_extent_length);
+  }
   // The resolve wrote the guest texture word layout into the GPU mirror of
   // shared memory (a DEFAULT buffer), not into guest memory itself. Guest
   // memory is what the swap's untiling upload reads, so the frame has to be

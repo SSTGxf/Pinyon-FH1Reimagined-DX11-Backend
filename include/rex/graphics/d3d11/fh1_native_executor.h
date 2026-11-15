@@ -51,9 +51,7 @@
  *              the resolve path's staging buffer remains the only write route
  *              (Part 1's contract).
  *
- *              Still open: per-owner rectangle splitting (SplitByOwner, for
- *              copy rectangles that mix owners), the resolve readback default,
- *              and scaled targets.
+ *              Still open: the resolve readback default and scaled targets.
  *
  * @copyright   Copyright (c) 2026 Tom Clay <tom@tctechstuff.com>
  *              All rights reserved.
@@ -134,12 +132,11 @@ class D3D11Fh1NativeExecutor {
 
   // The surface that holds the words under a copy's rectangle, from the tiles
   // the draws claimed: the packed key of their single owner, or
-  // Fh1EdramTiles::kNoOwner when the rectangle mixes owners (the caller then
-  // reads the surface its own key names). Tiles nobody claimed since Reset are
-  // not owners - nothing to inherit - and do not disqualify a rectangle. The
-  // format is not part of the decision: the EDRAM words are the same words,
-  // and the resolve shader reads them through the copy's format with the layout
-  // of the owner that wrote them (its two layout words).
+  // Fh1EdramTiles::kNoOwner when the rectangle mixes owners. Resolve dispatches
+  // use the split rectangles from SplitByOwner; tiles nobody claimed since
+  // Reset remain unowned. The format is not part of the decision: the EDRAM
+  // words are the same words, and the resolve shader reads them through the
+  // copy's format with the layout of the owner that wrote them.
   uint32_t ResolveSourceOwner(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1,
                               int32_t y1) const;
 
@@ -156,10 +153,11 @@ class D3D11Fh1NativeExecutor {
   // After the command processor issued the draw.
   void NativeDrawIssued(const Fh1DrawInfo& draw);
 
-  // A resolve-time clear: the guest clears tiles and then clears the native
-  // surface over the same rectangle, without a transfer of previous content.
-  void ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
-                    uint32_t clear_value, uint32_t clear_value_lo);
+  // A resolve-time clear: claims the guest's tiles, inherits previous contents
+  // for partially covered tiles, then clears only the requested pixel rectangle.
+  bool ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                    uint32_t clear_value, uint32_t clear_value_lo, bool clear_depth = true,
+                    bool clear_stencil = true);
 
   // After a resolve read its source through ResolveSourceOwner.
   void OwnerResolveIssued() { ++owner_resolves_; }
@@ -247,6 +245,8 @@ class D3D11Fh1NativeExecutor {
                            const RECT& rect, uint64_t dest_before);
 
   bool EnsureTransferResources();
+  bool EnsureClearResources();
+  ID3D11DepthStencilState* GetClearDepthStencilState(bool clear_depth, bool clear_stencil);
   ID3D11PixelShader* GetTransferShader(uint32_t source_kind, bool source_msaa,
                                        uint32_t dest_kind, bool dest_msaa);
 
@@ -255,7 +255,6 @@ class D3D11Fh1NativeExecutor {
   static SurfaceKey MakeDepthKey(uint32_t base, uint32_t pitch_tiles, uint32_t msaa,
                                  xenos::DepthRenderTargetFormat format);
   static uint32_t PitchTiles(uint32_t pitch_pixels, uint32_t msaa);
-  uint32_t SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const;
 
   D3D11CommandProcessor& command_processor_;
   const RegisterFile& register_file_;
@@ -276,6 +275,12 @@ class D3D11Fh1NativeExecutor {
   ID3D11RasterizerState* transfer_rasterizer_state_ = nullptr;
   ID3D11DepthStencilState* transfer_depth_stencil_state_ = nullptr;
   std::unordered_map<uint32_t, ID3D11PixelShader*> transfer_pixel_shaders_;
+  ID3D11RasterizerState* clear_rasterizer_state_ = nullptr;
+  ID3D11Buffer* clear_constants_ = nullptr;
+  ID3D11PixelShader* clear_color_shader_ = nullptr;
+  ID3D11PixelShader* clear_uint_shader_ = nullptr;
+  ID3D11PixelShader* clear_depth_shader_ = nullptr;
+  std::map<uint32_t, ID3D11DepthStencilState*> clear_depth_states_;
 
   // Depth destinations (C3): the guest EDRAM words of the previous owner in a
   // typed R32_UINT buffer, one element per word, plus the passes that write

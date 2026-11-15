@@ -12,6 +12,7 @@
 #include <rex/graphics/d3d11/fh1_native_executor.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <map>
 #include <string>
@@ -105,6 +106,9 @@ namespace shaders {
 #include "../shaders/bytecode/d3d11_5_0/fh1_native_transfer_stencil_from_uint_ms_ps.h"
 #include "../shaders/bytecode/d3d11_5_0/fh1_native_transfer_stencil_from_uint_ps.h"
 #include "../shaders/bytecode/d3d11_5_0/fullscreen_cw_vs.h"
+#include "../shaders/bytecode/d3d11_5_0/fh1_native_clear_color_ps.h"
+#include "../shaders/bytecode/d3d11_5_0/fh1_native_clear_uint_ps.h"
+#include "../shaders/bytecode/d3d11_5_0/fh1_native_clear_depth_ps.h"
 }  // namespace shaders
 
 namespace rex::graphics::d3d11 {
@@ -200,7 +204,7 @@ bool GetTileGeometry(const D3D11Fh1NativeSurface& surface, TileGeometry& geometr
   if (!surface.key.pitch_tiles || !surface.width || !surface.height) {
     return false;
   }
-  geometry.columns = surface.key.pitch_tiles;
+  geometry.columns = Fh1D3D11SurfaceTilePitch(surface.key);
   geometry.pixel_width = surface.width / geometry.columns;
   geometry.pixel_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
   if (!geometry.pixel_width || !geometry.pixel_height) {
@@ -211,6 +215,230 @@ bool GetTileGeometry(const D3D11Fh1NativeSurface& surface, TileGeometry& geometr
   geometry.surface_height = surface.height;
   return geometry.rows != 0;
 }
+
+template <typename Shader, typename Getter>
+void CaptureShader(Getter getter, Microsoft::WRL::ComPtr<Shader>& shader,
+                   std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>>& instances) {
+  std::array<ID3D11ClassInstance*, 256> raw_instances = {};
+  UINT count = UINT(raw_instances.size());
+  getter(shader.GetAddressOf(), raw_instances.data(), &count);
+  instances.reserve(count);
+  for (UINT i = 0; i < count; ++i) {
+    Microsoft::WRL::ComPtr<ID3D11ClassInstance> instance;
+    instance.Attach(raw_instances[i]);
+    instances.push_back(std::move(instance));
+  }
+}
+
+template <typename Setter, typename Shader>
+void RestoreShader(Setter setter, Shader* shader,
+                  const std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>>& instances) {
+  std::vector<ID3D11ClassInstance*> raw_instances;
+  raw_instances.reserve(instances.size());
+  for (const auto& instance : instances) raw_instances.push_back(instance.Get());
+  setter(shader, raw_instances.empty() ? nullptr : raw_instances.data(),
+         UINT(raw_instances.size()));
+}
+
+class ScopedD3D11ClearState {
+ public:
+  explicit ScopedD3D11ClearState(ID3D11DeviceContext* context) : context_(context) {
+    ID3D11RenderTargetView* raw_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11UnorderedAccessView* raw_om_uavs[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+    context_->OMGetRenderTargetsAndUnorderedAccessViews(
+        UINT(std::size(raw_rtvs)), raw_rtvs, dsv_.GetAddressOf(), 0,
+        UINT(std::size(raw_om_uavs)), raw_om_uavs);
+    for (size_t i = 0; i < std::size(raw_rtvs); ++i) rtvs_[i].Attach(raw_rtvs[i]);
+    for (size_t i = 0; i < std::size(raw_om_uavs); ++i) om_uavs_[i].Attach(raw_om_uavs[i]);
+
+    context_->OMGetBlendState(blend_.GetAddressOf(), blend_factor_, &sample_mask_);
+    context_->OMGetDepthStencilState(depth_stencil_.GetAddressOf(), &stencil_ref_);
+    context_->RSGetState(rasterizer_.GetAddressOf());
+    viewport_count_ = UINT(viewports_.size());
+    context_->RSGetViewports(&viewport_count_, viewports_.data());
+    scissor_count_ = UINT(scissors_.size());
+    context_->RSGetScissorRects(&scissor_count_, scissors_.data());
+    context_->IAGetInputLayout(input_layout_.GetAddressOf());
+    context_->IAGetPrimitiveTopology(&topology_);
+    context_->PSGetConstantBuffers(0, 1, pixel_constant_buffer_.GetAddressOf());
+    context_->CSGetConstantBuffers(0, 1, compute_constant_buffer_.GetAddressOf());
+
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->VSGetShader(shader, instances, count);
+    }, vertex_shader_, vertex_instances_);
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->HSGetShader(shader, instances, count);
+    }, hull_shader_, hull_instances_);
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->DSGetShader(shader, instances, count);
+    }, domain_shader_, domain_instances_);
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->GSGetShader(shader, instances, count);
+    }, geometry_shader_, geometry_instances_);
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->PSGetShader(shader, instances, count);
+    }, pixel_shader_, pixel_instances_);
+    CaptureShader([&](auto shader, auto instances, auto count) {
+      context_->CSGetShader(shader, instances, count);
+    }, compute_shader_, compute_instances_);
+
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->VSGetShaderResources(first, count, views);
+    }, vertex_srvs_);
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->HSGetShaderResources(first, count, views);
+    }, hull_srvs_);
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->DSGetShaderResources(first, count, views);
+    }, domain_srvs_);
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->GSGetShaderResources(first, count, views);
+    }, geometry_srvs_);
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->PSGetShaderResources(first, count, views);
+    }, pixel_srvs_);
+    CaptureSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView** views) {
+      context_->CSGetShaderResources(first, count, views);
+    }, compute_srvs_);
+
+    ID3D11UnorderedAccessView* raw_uavs[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+    context_->CSGetUnorderedAccessViews(0, UINT(std::size(raw_uavs)), raw_uavs);
+    for (size_t i = 0; i < std::size(raw_uavs); ++i) compute_uavs_[i].Attach(raw_uavs[i]);
+  }
+
+  ~ScopedD3D11ClearState() {
+    ID3D11RenderTargetView* raw_rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    UINT rtv_count = 0;
+    for (size_t i = 0; i < std::size(raw_rtvs); ++i) {
+      raw_rtvs[i] = rtvs_[i].Get();
+      if (raw_rtvs[i]) rtv_count = UINT(i + 1);
+    }
+    ID3D11UnorderedAccessView* raw_om_uavs[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+    UINT om_uav_counts[D3D11_PS_CS_UAV_REGISTER_COUNT];
+    for (size_t i = 0; i < std::size(raw_om_uavs); ++i) {
+      raw_om_uavs[i] = om_uavs_[i].Get();
+      om_uav_counts[i] = UINT(-1);
+    }
+    context_->OMSetRenderTargetsAndUnorderedAccessViews(
+        rtv_count, raw_rtvs, dsv_.Get(), rtv_count,
+        UINT(std::size(raw_om_uavs)) - rtv_count, raw_om_uavs + rtv_count,
+        om_uav_counts + rtv_count);
+    context_->OMSetBlendState(blend_.Get(), blend_factor_, sample_mask_);
+    context_->OMSetDepthStencilState(depth_stencil_.Get(), stencil_ref_);
+    context_->RSSetState(rasterizer_.Get());
+    context_->RSSetViewports(viewport_count_, viewport_count_ ? viewports_.data() : nullptr);
+    context_->RSSetScissorRects(scissor_count_, scissor_count_ ? scissors_.data() : nullptr);
+    context_->IASetInputLayout(input_layout_.Get());
+    context_->IASetPrimitiveTopology(topology_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->VSSetShader(shader, instances, count);
+    }, vertex_shader_.Get(), vertex_instances_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->HSSetShader(shader, instances, count);
+    }, hull_shader_.Get(), hull_instances_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->DSSetShader(shader, instances, count);
+    }, domain_shader_.Get(), domain_instances_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->GSSetShader(shader, instances, count);
+    }, geometry_shader_.Get(), geometry_instances_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->PSSetShader(shader, instances, count);
+    }, pixel_shader_.Get(), pixel_instances_);
+    RestoreShader([&](auto shader, auto instances, auto count) {
+      context_->CSSetShader(shader, instances, count);
+    }, compute_shader_.Get(), compute_instances_);
+    context_->PSSetConstantBuffers(0, 1, pixel_constant_buffer_.GetAddressOf());
+    context_->CSSetConstantBuffers(0, 1, compute_constant_buffer_.GetAddressOf());
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->VSSetShaderResources(first, count, views);
+    }, vertex_srvs_);
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->HSSetShaderResources(first, count, views);
+    }, hull_srvs_);
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->DSSetShaderResources(first, count, views);
+    }, domain_srvs_);
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->GSSetShaderResources(first, count, views);
+    }, geometry_srvs_);
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->PSSetShaderResources(first, count, views);
+    }, pixel_srvs_);
+    RestoreSrvs([&](UINT first, UINT count, ID3D11ShaderResourceView* const* views) {
+      context_->CSSetShaderResources(first, count, views);
+    }, compute_srvs_);
+    ID3D11UnorderedAccessView* raw_uavs[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
+    for (size_t i = 0; i < std::size(raw_uavs); ++i) raw_uavs[i] = compute_uavs_[i].Get();
+    context_->CSSetUnorderedAccessViews(0, UINT(std::size(raw_uavs)), raw_uavs, nullptr);
+  }
+
+ private:
+  template <typename Getter>
+  static void CaptureSrvs(Getter getter,
+                          std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+                                     D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>& views) {
+    std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> raw = {};
+    getter(0, UINT(raw.size()), raw.data());
+    for (size_t i = 0; i < raw.size(); ++i) views[i].Attach(raw[i]);
+  }
+
+  template <typename Setter>
+  static void RestoreSrvs(Setter setter,
+                          const std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+                                           D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>& views) {
+    std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> raw = {};
+    for (size_t i = 0; i < raw.size(); ++i) raw[i] = views[i].Get();
+    setter(0, UINT(raw.size()), raw.data());
+  }
+
+  ID3D11DeviceContext* context_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>,
+             D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> rtvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>,
+             D3D11_PS_CS_UAV_REGISTER_COUNT> om_uavs_;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilView> dsv_;
+  Microsoft::WRL::ComPtr<ID3D11BlendState> blend_;
+  float blend_factor_[4] = {};
+  UINT sample_mask_ = 0;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilState> depth_stencil_;
+  UINT stencil_ref_ = 0;
+  Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_;
+  std::array<D3D11_VIEWPORT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_ = {};
+  UINT viewport_count_ = 0;
+  std::array<D3D11_RECT, D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors_ = {};
+  UINT scissor_count_ = 0;
+  Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout_;
+  D3D11_PRIMITIVE_TOPOLOGY topology_ = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> pixel_constant_buffer_;
+  Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader_;
+  Microsoft::WRL::ComPtr<ID3D11HullShader> hull_shader_;
+  Microsoft::WRL::ComPtr<ID3D11DomainShader> domain_shader_;
+  Microsoft::WRL::ComPtr<ID3D11GeometryShader> geometry_shader_;
+  Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader_;
+  Microsoft::WRL::ComPtr<ID3D11ComputeShader> compute_shader_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> vertex_instances_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> hull_instances_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> domain_instances_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> geometry_instances_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> pixel_instances_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D11ClassInstance>> compute_instances_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> vertex_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> hull_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> domain_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> geometry_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> pixel_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+             D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> compute_srvs_;
+  std::array<Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView>,
+             D3D11_PS_CS_UAV_REGISTER_COUNT> compute_uavs_;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> compute_constant_buffer_;
+};
 
 // The pixels of a run of tiles that is contiguous in EDRAM tile indices: the
 // rest of the first tile row, whole rows, and the start of the last row - at
@@ -361,6 +589,30 @@ void D3D11Fh1NativeExecutor::Shutdown() {
     }
   }
   transfer_depth_states_.clear();
+  for (auto& entry : clear_depth_states_) {
+    if (entry.second) entry.second->Release();
+  }
+  clear_depth_states_.clear();
+  if (clear_depth_shader_) {
+    clear_depth_shader_->Release();
+    clear_depth_shader_ = nullptr;
+  }
+  if (clear_uint_shader_) {
+    clear_uint_shader_->Release();
+    clear_uint_shader_ = nullptr;
+  }
+  if (clear_color_shader_) {
+    clear_color_shader_->Release();
+    clear_color_shader_ = nullptr;
+  }
+  if (clear_rasterizer_state_) {
+    clear_rasterizer_state_->Release();
+    clear_rasterizer_state_ = nullptr;
+  }
+  if (clear_constants_) {
+    clear_constants_->Release();
+    clear_constants_ = nullptr;
+  }
   if (transfer_words_srv_) {
     transfer_words_srv_->Release();
     transfer_words_srv_ = nullptr;
@@ -417,10 +669,6 @@ uint32_t D3D11Fh1NativeExecutor::PitchTiles(uint32_t pitch_pixels, uint32_t msaa
   // path and the resolve both use: a different rounding here would derive a
   // different surface key and bind surfaces the resolve never reads.
   return Fh1PitchTiles(pitch_pixels, msaa);
-}
-
-uint32_t D3D11Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) const {
-  return Fh1SurfaceHeight(pitch_tiles, msaa, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION, config_.scale);
 }
 
 void D3D11Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw, int32_t claim_x0,
@@ -531,7 +779,7 @@ void D3D11Fh1NativeExecutor::ClaimTargetTiles(const SurfaceKey& key,
   }
 
   const uint32_t packed_key = key.Pack();
-  const uint32_t pitch = key.pitch_tiles;
+  const uint32_t pitch = Fh1D3D11SurfaceTilePitch(key);
   const uint32_t row_tiles = column_end - column_first;
   ++claims_;
   claimed_tiles_ += uint64_t(row_tiles) * (row_end - row_first);
@@ -703,9 +951,10 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
 
   // The same host format and geometry is a plain copy of the tiles: exact, and
   // cheaper than the shader.
-  const bool same_geometry = dest_key.pitch_tiles == source->key.pitch_tiles &&
-                             dest_key.msaa == source->key.msaa &&
-                             dest_key.is_depth == source->key.is_depth;
+  const bool same_geometry =
+      Fh1D3D11SurfaceTilePitch(dest_key) == Fh1D3D11SurfaceTilePitch(source->key) &&
+      dest_key.Is64bpp() == source->key.Is64bpp() && dest_key.msaa == source->key.msaa &&
+      dest_key.is_depth == source->key.is_depth;
   if (same_geometry && dest_desc.Format == source_desc.Format &&
       dest_desc.SampleDesc.Count == source_desc.SampleDesc.Count) {
     // A depth copy is the clearest probe of all: the same rectangle of the same
@@ -812,6 +1061,7 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   int64_t probe_before = -1;
   const bool probe = REXCVAR_GET(fh1_swap_fetch_trace) && transfer_verified_ < 8 &&
                      dest_key.pitch_tiles == source->key.pitch_tiles &&
+                     dest_key.Is64bpp() == source->key.Is64bpp() &&
                      dest_key.msaa == source->key.msaa && dest.samples == 1 &&
                      source->samples == 1;
   if (probe) {
@@ -1132,6 +1382,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
   // same top-left rectangle C3 probed, not rectangles whose rows mean other
   // EDRAM samples in the predecessor.
   const bool same_layout = dest_key.pitch_tiles == source.key.pitch_tiles &&
+                           dest_key.Is64bpp() == source.key.Is64bpp() &&
                            dest_key.msaa == source.key.msaa &&
                            dest.samples == source.samples;
   int64_t probe_before = -1;
@@ -1755,6 +2006,88 @@ bool D3D11Fh1NativeExecutor::EnsureTransferResources() {
          transfer_depth_stencil_state_;
 }
 
+bool D3D11Fh1NativeExecutor::EnsureClearResources() {
+  if (!EnsureTransferResources()) return false;
+  ID3D11Device* device = command_processor_.GetD3D11Provider().GetDevice();
+  if (!device) return false;
+  if (!clear_constants_) {
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = 16;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &clear_constants_))) {
+      clear_constants_ = nullptr;
+      REXGPU_ERROR("D3D11 FH1 native executor: rectangle-clear constants creation failed");
+      return false;
+    }
+  }
+  if (!clear_rasterizer_state_) {
+    D3D11_RASTERIZER_DESC desc = {};
+    desc.FillMode = D3D11_FILL_SOLID;
+    desc.CullMode = D3D11_CULL_NONE;
+    desc.DepthClipEnable = TRUE;
+    desc.ScissorEnable = TRUE;
+    if (FAILED(device->CreateRasterizerState(&desc, &clear_rasterizer_state_))) {
+      clear_rasterizer_state_ = nullptr;
+      REXGPU_ERROR("D3D11 FH1 native executor: rectangle-clear rasterizer creation failed");
+      return false;
+    }
+  }
+  if (!clear_color_shader_ &&
+      FAILED(device->CreatePixelShader(shaders::fh1_native_clear_color_ps,
+                                       sizeof(shaders::fh1_native_clear_color_ps), nullptr,
+                                       &clear_color_shader_))) {
+    clear_color_shader_ = nullptr;
+    REXGPU_ERROR("D3D11 FH1 native executor: color-clear pixel shader creation failed");
+    return false;
+  }
+  if (!clear_uint_shader_ &&
+      FAILED(device->CreatePixelShader(shaders::fh1_native_clear_uint_ps,
+                                       sizeof(shaders::fh1_native_clear_uint_ps), nullptr,
+                                       &clear_uint_shader_))) {
+    clear_uint_shader_ = nullptr;
+    REXGPU_ERROR("D3D11 FH1 native executor: UINT-clear pixel shader creation failed");
+    return false;
+  }
+  if (!clear_depth_shader_ &&
+      FAILED(device->CreatePixelShader(shaders::fh1_native_clear_depth_ps,
+                                       sizeof(shaders::fh1_native_clear_depth_ps), nullptr,
+                                       &clear_depth_shader_))) {
+    clear_depth_shader_ = nullptr;
+    REXGPU_ERROR("D3D11 FH1 native executor: depth-clear pixel shader creation failed");
+    return false;
+  }
+  return true;
+}
+
+ID3D11DepthStencilState* D3D11Fh1NativeExecutor::GetClearDepthStencilState(
+    bool clear_depth, bool clear_stencil) {
+  const uint32_t key = uint32_t(clear_depth) | (uint32_t(clear_stencil) << 1);
+  auto it = clear_depth_states_.find(key);
+  if (it != clear_depth_states_.end()) return it->second;
+  ID3D11Device* device = command_processor_.GetD3D11Provider().GetDevice();
+  D3D11_DEPTH_STENCIL_DESC desc = {};
+  desc.DepthEnable = clear_depth ? TRUE : FALSE;
+  desc.DepthWriteMask = clear_depth ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+  desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+  desc.StencilEnable = clear_stencil ? TRUE : FALSE;
+  desc.StencilReadMask = 0;
+  desc.StencilWriteMask = clear_stencil ? 0xFF : 0;
+  desc.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+  desc.FrontFace.StencilFailOp = D3D11_STENCIL_OP_KEEP;
+  desc.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_KEEP;
+  desc.FrontFace.StencilPassOp = clear_stencil ? D3D11_STENCIL_OP_REPLACE : D3D11_STENCIL_OP_KEEP;
+  desc.BackFace = desc.FrontFace;
+  ID3D11DepthStencilState* state = nullptr;
+  if (!device || FAILED(device->CreateDepthStencilState(&desc, &state))) {
+    REXGPU_ERROR("D3D11 FH1 native executor: rectangle-clear depth state creation failed");
+    return nullptr;
+  }
+  clear_depth_states_.emplace(key, state);
+  return state;
+}
+
 ID3D11PixelShader* D3D11Fh1NativeExecutor::GetTransferShader(uint32_t source_kind,
                                                              bool source_msaa, uint32_t dest_kind,
                                                              bool dest_msaa) {
@@ -1880,10 +2213,10 @@ uint32_t D3D11Fh1NativeExecutor::ResolveSourceOwner(const Fh1SurfaceKey& key, in
   if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
     return Fh1EdramTiles::kNoOwner;
   }
-  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const int32_t tile_width = int32_t(xenos::kEdramTileWidthSamples >> msaa_x_log2);
+  const int32_t tile_width = int32_t(Fh1D3D11SurfaceTileWidth(key));
   const int32_t tile_height = int32_t(xenos::kEdramTileHeightSamples >> msaa_y_log2);
+  const uint32_t pitch = Fh1D3D11SurfaceTilePitch(key);
   const int32_t column_first = x0 / tile_width,
                 column_end = (x1 + tile_width - 1) / tile_width;
   const int32_t row_first = y0 / tile_height, row_end = (y1 + tile_height - 1) / tile_height;
@@ -1904,7 +2237,7 @@ uint32_t D3D11Fh1NativeExecutor::ResolveSourceOwner(const Fh1SurfaceKey& key, in
   for (int32_t row = row_first; row < row_end; ++row) {
     for (int32_t column = column_first; column < column_end; ++column) {
       const uint32_t tile_owner = tiles_.Owner(key.base_tiles +
-                                               uint32_t(row) * key.pitch_tiles +
+                                               uint32_t(row) * pitch +
                                                uint32_t(column));
       if (tile_owner == Fh1EdramTiles::kNoOwner) {
         // Never claimed since Reset: nothing was written, and the surface the
@@ -1967,17 +2300,17 @@ std::map<uint32_t, uint32_t> D3D11Fh1NativeExecutor::EnumerateResolveOwners(
   if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
     return owners;
   }
-  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const int32_t tile_width = int32_t(xenos::kEdramTileWidthSamples >> msaa_x_log2);
+  const int32_t tile_width = int32_t(Fh1D3D11SurfaceTileWidth(key));
   const int32_t tile_height = int32_t(xenos::kEdramTileHeightSamples >> msaa_y_log2);
+  const uint32_t pitch = Fh1D3D11SurfaceTilePitch(key);
   const int32_t column_first = x0 / tile_width,
                 column_end = (x1 + tile_width - 1) / tile_width;
   const int32_t row_first = y0 / tile_height, row_end = (y1 + tile_height - 1) / tile_height;
   for (int32_t row = row_first; row < row_end; ++row) {
     for (int32_t column = column_first; column < column_end; ++column) {
       const uint32_t tile_owner = tiles_.Owner(key.base_tiles +
-                                               uint32_t(row) * key.pitch_tiles +
+                                               uint32_t(row) * pitch +
                                                uint32_t(column));
       ++owners[tile_owner];
     }
@@ -1985,91 +2318,190 @@ std::map<uint32_t, uint32_t> D3D11Fh1NativeExecutor::EnumerateResolveOwners(
   return owners;
 }
 
-void D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0,
-                                           int32_t x1, int32_t y1, uint32_t clear_value,
-                                           uint32_t clear_value_lo) {
+bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0,
+                                          int32_t x1, int32_t y1, uint32_t clear_value,
+                                          uint32_t clear_value_lo, bool clear_depth,
+                                          bool clear_stencil) {
   if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
-    return;
+    return false;
   }
   D3D11Fh1NativeSurface* surface = config_.surfaces->GetOrCreateSurface(key);
   if (!surface) {
-    return;
+    REXGPU_ERROR("D3D11 FH1 native executor: resolve-clear surface creation failed for {}",
+                 key.Describe());
+    return false;
   }
-  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
   const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
-  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_width = Fh1D3D11SurfaceTileWidth(key);
   const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
-  const uint32_t pitch = key.pitch_tiles;
-  const uint32_t column_first = uint32_t(x0) / tile_width;
-  const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
-  const uint32_t row_first = uint32_t(y0) / tile_height;
-  const uint32_t row_end = (uint32_t(y1) + tile_height - 1) / tile_height;
-
-  for (uint32_t row = row_first; row < row_end; ++row) {
-    const uint32_t row_base = key.base_tiles + row * pitch + column_first;
-    for (uint32_t column = column_first; column < column_end; ++column) {
-      tiles_.Claim(row_base + column - column_first, 1, key.Pack(), false);
-    }
-    if (key.is_depth) {
-      tiles_.MarkStencil(row_base, column_end - column_first, (clear_value & 0xFF) != 0);
-    }
+  TileGeometry geometry;
+  if (!GetTileGeometry(*surface, geometry)) {
+    REXGPU_ERROR("D3D11 FH1 native executor: resolve-clear geometry unavailable for {}",
+                 key.Describe());
+    return false;
   }
+  const int32_t left = std::max(x0, 0);
+  const int32_t top = std::max(y0, 0);
+  const int32_t right = std::min(x1, int32_t(geometry.surface_width));
+  const int32_t bottom = std::min(y1, int32_t(geometry.surface_height));
+  if (left >= right || top >= bottom) return true;
+  if (key.is_depth && !clear_depth && !clear_stencil) return true;
+  const RECT rect = {LONG(left), LONG(top), LONG(right), LONG(bottom)};
 
-  const RECT rect = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
-  auto* context = command_processor_.GetD3D11Provider().GetImmediateContext();
+  float color[4] = {};
+  uint32_t raw_color[4] = {};
+  bool use_uint_view = false;
   if (key.is_depth) {
-    const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
-    const float value = xenos::DepthRenderTargetFormat(key.format) ==
-                                xenos::DepthRenderTargetFormat::kD24FS8
-                            ? xenos::Float20e4To32(depth_bits) * 0.5f
-                            : xenos::UNorm24To32(depth_bits);
-    surface->stencil_nonzero = (clear_value & 0xFF) != 0;
-    context->ClearDepthStencilView(surface->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, value,
-                                   uint8_t(clear_value & 0xFF));
+    if (!surface->dsv || !EnsureClearResources() ||
+        !GetClearDepthStencilState(clear_depth, clear_stencil)) {
+      return false;
+    }
   } else {
-    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     switch (xenos::ColorRenderTargetFormat(key.format)) {
       case xenos::ColorRenderTargetFormat::k_8_8_8_8:
       case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
-        for (uint32_t i = 0; i < 4; ++i) color[i] = float((clear_value >> (8 * i)) & 0xFF) / 255.0f;
+        for (uint32_t i = 0; i < 4; ++i) {
+          color[i] = float((clear_value >> (8 * i)) & 0xFF) / 255.0f;
+        }
         break;
       case xenos::ColorRenderTargetFormat::k_2_10_10_10:
-        for (uint32_t i = 0; i < 3; ++i) color[i] = float((clear_value >> (10 * i)) & 0x3FF) / 1023.0f;
+        for (uint32_t i = 0; i < 3; ++i) {
+          color[i] = float((clear_value >> (10 * i)) & 0x3FF) / 1023.0f;
+        }
         color[3] = float(clear_value >> 30) / 3.0f;
         break;
       case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        for (uint32_t i = 0; i < 3; ++i) color[i] = xenos::Float7e3To32((clear_value >> (10 * i)) & 0x3FF);
+        for (uint32_t i = 0; i < 3; ++i) {
+          color[i] = xenos::Float7e3To32((clear_value >> (10 * i)) & 0x3FF);
+        }
         color[3] = float(clear_value >> 30) / 3.0f;
         break;
       case xenos::ColorRenderTargetFormat::k_32_FLOAT:
         std::memcpy(&color[0], &clear_value, sizeof(float));
         break;
       case xenos::ColorRenderTargetFormat::k_16_16:
-      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
       case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
       case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
-        const bool is_float = key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_FLOAT) ||
-                              key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT);
         const uint32_t words[2] = {key.Is64bpp() ? clear_value_lo : clear_value, clear_value};
         for (uint32_t i = 0; i < (key.Is64bpp() ? 4u : 2u); ++i) {
-          const uint16_t bits = uint16_t(words[i >> 1] >> (16 * (i & 1)));
-          color[i] = is_float ? std::bit_cast<float>(uint32_t(bits))
-                              : std::max(float(int16_t(bits)) / 32767.0f, -1.0f);
+          raw_color[i] = (words[i >> 1] >> (16 * (i & 1))) & 0xFFFF;
         }
+        use_uint_view = true;
         break;
       }
       case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
-        std::memcpy(&color[0], &clear_value_lo, sizeof(float));
-        std::memcpy(&color[1], &clear_value, sizeof(float));
+        raw_color[0] = clear_value_lo;
+        raw_color[1] = clear_value;
+        use_uint_view = true;
         break;
       default:
         if (clear_value || clear_value_lo) {
-          return;
+          REXGPU_WARN("D3D11 FH1 native executor: unsupported resolve-clear format {}",
+                      key.Describe());
+          return false;
         }
         break;
     }
-    context->ClearRenderTargetView(surface->rtv, color);
+    if (!EnsureClearResources()) return false;
+    if ((use_uint_view && !surface->uint_rtv) || (!use_uint_view && !surface->rtv)) {
+      REXGPU_ERROR("D3D11 FH1 native executor: resolve-clear view unavailable for {}",
+                   key.Describe());
+      return false;
+    }
   }
+
+  auto* context = command_processor_.GetD3D11Provider().GetImmediateContext();
+  if (!context) {
+    REXGPU_ERROR("D3D11 FH1 native executor: no immediate context for resolve clear");
+    return false;
+  }
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  if (FAILED(context->Map(clear_constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+    REXGPU_ERROR("D3D11 FH1 native executor: resolve-clear constants map failed");
+    return false;
+  }
+  uint32_t constants[4] = {};
+  if (key.is_depth && clear_depth) {
+    const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
+    const float value = xenos::DepthRenderTargetFormat(key.format) ==
+                                xenos::DepthRenderTargetFormat::kD24FS8
+                            ? xenos::Float20e4To32(depth_bits) * 0.5f
+                            : xenos::UNorm24To32(depth_bits);
+    std::memcpy(&constants[0], &value, sizeof(value));
+  } else if (use_uint_view) {
+    std::memcpy(constants, raw_color, sizeof(raw_color));
+  } else {
+    std::memcpy(constants, color, sizeof(color));
+  }
+  std::memcpy(mapped.pData, constants, sizeof(constants));
+  context->Unmap(clear_constants_, 0);
+
+  ScopedD3D11ClearState saved_state(context);
+  const uint32_t pitch = Fh1D3D11SurfaceTilePitch(key);
+  const uint32_t column_first = uint32_t(left) / tile_width;
+  const uint32_t column_end = (uint32_t(right) + tile_width - 1) / tile_width;
+  const uint32_t row_first = uint32_t(top) / tile_height;
+  const uint32_t row_end = (uint32_t(bottom) + tile_height - 1) / tile_height;
+  for (uint32_t row = row_first; row < row_end; ++row) {
+    const uint32_t row_base = key.base_tiles + row * pitch;
+    const bool full_row = row * tile_height >= uint32_t(top) &&
+                          (row + 1) * tile_height <= uint32_t(bottom);
+    for (uint32_t column = column_first; column < column_end; ++column) {
+      const bool full_column = column * tile_width >= uint32_t(left) &&
+                               (column + 1) * tile_width <= uint32_t(right);
+      const bool transfer = !(full_row && full_column);
+      const std::vector<Fh1EdramTiles::Run> runs =
+          tiles_.Claim(row_base + column, 1, key.Pack(), transfer);
+      for (const Fh1EdramTiles::Run& run : runs) {
+        QueueTransferRun(key, *surface, run.previous_owner, run.first, run.count);
+      }
+      if (key.is_depth && clear_stencil) {
+        if (clear_value & 0xFF) {
+          tiles_.MarkStencil(row_base + column, 1, true);
+        } else if (full_row && full_column) {
+          tiles_.MarkStencil(row_base + column, 1, false);
+        }
+      }
+    }
+  }
+  FlushClaimTransfers(key, *surface);
+
+  ID3D11RenderTargetView* target =
+      key.is_depth ? nullptr : (use_uint_view ? surface->uint_rtv : surface->rtv);
+  context->OMSetRenderTargets(target ? 1 : 0, target ? &target : nullptr,
+                              key.is_depth ? surface->dsv : nullptr);
+  context->OMSetBlendState(nullptr, nullptr, Fh1D3D11SampleMask(key, surface->samples));
+  ID3D11DepthStencilState* depth_state =
+      key.is_depth ? GetClearDepthStencilState(clear_depth, clear_stencil) : nullptr;
+  if (key.is_depth && !depth_state) return false;
+  context->OMSetDepthStencilState(depth_state, uint8_t(clear_value & 0xFF));
+  context->RSSetState(clear_rasterizer_state_);
+  D3D11_VIEWPORT viewport = {};
+  viewport.Width = float(surface->width);
+  viewport.Height = float(surface->height);
+  viewport.MaxDepth = 1.0f;
+  context->RSSetViewports(1, &viewport);
+  context->RSSetScissorRects(1, &rect);
+  context->IASetInputLayout(nullptr);
+  context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  context->HSSetShader(nullptr, nullptr, 0);
+  context->DSSetShader(nullptr, nullptr, 0);
+  context->GSSetShader(nullptr, nullptr, 0);
+  context->VSSetShader(transfer_vertex_shader_, nullptr, 0);
+  context->PSSetShader(key.is_depth ? clear_depth_shader_
+                                    : (use_uint_view ? clear_uint_shader_ : clear_color_shader_),
+                       nullptr, 0);
+  context->PSSetConstantBuffers(0, 1, &clear_constants_);
+  context->Draw(3, 0);
+  if (key.is_depth && clear_stencil) {
+    const bool full_surface =
+        left == 0 && top == 0 && right == int32_t(surface->width) &&
+        bottom == int32_t(surface->height);
+    surface->stencil_nonzero =
+        (clear_value & 0xFF) != 0 || (surface->stencil_nonzero && !full_surface);
+  }
+  return true;
 }
 
 void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
