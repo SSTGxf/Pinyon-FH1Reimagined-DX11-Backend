@@ -64,6 +64,8 @@ REXCVAR_DECLARE(std::string, dump_shaders);
 REXCVAR_DECLARE(bool, fh1_d3d11_shader_pack);
 REXCVAR_DECLARE(bool, fh1_swap_fetch_trace);
 REXCVAR_DECLARE(int32_t, fh1_debug_tile_trace_swap);
+REXCVAR_DECLARE(int32_t, fh1_debug_band2_trace_swap);
+REXCVAR_DECLARE(int32_t, fh1_debug_band_suppress);
 REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
 REXCVAR_DECLARE(bool, fh1_d3d11_resolve_readback);
 REXCVAR_DECLARE(bool, fh1_d3d11_command_lists);

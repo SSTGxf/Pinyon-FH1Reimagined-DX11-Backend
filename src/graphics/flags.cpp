@@ -23,6 +23,13 @@ REXCVAR_DEFINE_BOOL(fh1_debug_disable_msaa, false, "GPU",
 REXCVAR_DEFINE_INT32(fh1_debug_tile_trace_swap, 338, "GPU",
                      "Log D3D11 FH1 draw tile window/viewport/scissor state and 4x source row "
                      "hashes before resolves on this presented frame; 0 disables");
+REXCVAR_DEFINE_INT32(fh1_debug_band2_trace_swap, 0, "GPU",
+                     "Trace FH1 Band 2 packets and draw processing for this PM4 XE_SWAP frame; "
+                     "0 disables");
+REXCVAR_DEFINE_INT32(fh1_debug_band_suppress, 0, "GPU",
+                     "Diagnostic draw suppression mask: bit 0 suppresses pass 0 (bin select 3), "
+                     "bit 1 pass 1 (0xC), bit 2 pass 2 (0x30); copy/resolve/clear packets are "
+                     "not suppressed; 0 disables");
 REXCVAR_DEFINE_INT32(fh1_debug_minimap_capture_swap, 338, "GPU",
                      "Capture one 320x192 FH1 minimap candidate at source, resolved guest bytes, "
                      "and sampled texture stages on this presented frame; 0 disables");
@@ -98,7 +105,8 @@ REXCVAR_DEFINE_BOOL(pinyon_audit, false, "GPU",
                      "Write one JSONL render-audit record per 300 frames: bound RT sample counts, resolve sample counts, draw tally and error tally")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(pinyon_resolve_trace, false, "GPU",
-                     "Log each large resolve's destination base, pitch and copy parameters");
+                     "Capture the next three large D3D11 FH1 resolves: owner rectangles, source "
+                     "row hashes, resolve completion and the guest-memory mirror");
 REXCVAR_DEFINE_BOOL(fh1_resolve_swap_rb, false, "GPU",
                      "Resolve colour surfaces with red and blue exchanged: the guest's swap bit (dest_info 6) inverted for 3D content only, never for presentation");
 REXCVAR_DEFINE_INT32(fh1_debug_resolve_force_pack, -1, "GPU",

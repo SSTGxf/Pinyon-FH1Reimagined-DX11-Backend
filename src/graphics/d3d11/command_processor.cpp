@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -1712,6 +1713,22 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitFrameTape("draw");
   }
   const RegisterFile& regs = *register_file_;
+  const int32_t tile_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+  const bool trace_tile = tile_trace_swap > 0 &&
+                          presented_output_frames_ == uint64_t(tile_trace_swap);
+  const bool trace_band2 = current_draw_band_trace_ && current_draw_tiling_pass_ == 1;
+  auto trace_tile_path = [&](const char* stage) {
+    if (!trace_tile && !trace_band2) return;
+    const auto& window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    REXGPU_INFO(
+        "{} swap={} stage={} pass={} issued={} window_y={} mode={} "
+        "select={:016X} mask={:016X}",
+        trace_band2 ? "FH1 band2 D3D11" : "FH1 tile path",
+        presented_output_frames_, stage, current_draw_tiling_pass_, draw_counters_.issued,
+        int32_t(window_offset.window_y_offset), regs[XE_GPU_REG_RB_MODECONTROL] & 7,
+        current_draw_bin_select_, current_draw_bin_mask_);
+  };
+  trace_tile_path("issue_enter");
   // fh1_debug_texture_dump (PHASE 10): set when this draw is the post pass, so
   // the frame's surface is dumped again once the draw has run - the difference
   // between the two dumps is exactly what the pass wrote, which no pre-draw
@@ -1722,6 +1739,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
+    trace_tile_path("copy_mode");
     return IssueCopy();
   }
 
@@ -1729,6 +1747,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   auto vertex_shader = static_cast<D3D11Shader*>(active_vertex_shader());
   if (!vertex_shader) {
+    trace_tile_path("no_vertex_shader");
     ++draw_counters_.dropped_other;
     return false;
   }
@@ -1738,6 +1757,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool primitive_polygonal = draw_util::IsPrimitivePolygonal(regs);
   bool is_rasterization_done = draw_util::IsRasterizationPotentiallyDone(regs, primitive_polygonal);
   if (surface_pitch_is_zero && is_rasterization_done) {
+    trace_tile_path("zero_surface_pitch");
     return true;
   }
   D3D11Shader* pixel_shader = nullptr;
@@ -1753,6 +1773,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   } else {
     if (!memexport_used_vertex) {
+      trace_tile_path("no_rasterization_no_memexport");
       return true;
     }
   }
@@ -1766,25 +1787,30 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (!memexport_used && !normalized_depth_control.z_enable &&
       !normalized_depth_control.stencil_enable && !normalized_color_mask) {
     // No guest-visible output.
+    trace_tile_path("no_guest_visible_output");
     return true;
   }
   if (memexport_used) {
     // Memexport needs a UAV-bound shared memory; feature level 11_0 has no
     // vertex-shader UAVs and the FH1 executor route (Step C) owns transfers.
+    trace_tile_path("memexport_not_supported");
     ++draw_counters_.dropped_memexport;
     return true;
   }
 
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
+    trace_tile_path("primitive_processor_failed");
     ++draw_counters_.dropped_other;
     return false;
   }
   if (!primitive_processing_result.host_draw_vertex_count) {
+    trace_tile_path("zero_host_vertex_count");
     return true;
   }
   if (primitive_processing_result.IsTessellated()) {
     // Hull/domain translations are not part of Phase 3.
+    trace_tile_path("tessellation_not_supported");
     ++draw_counters_.dropped_tessellation;
     return true;
   }
@@ -1839,8 +1865,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                               int32_t(scissor.offset[1] + scissor.extent[1]));
 
   // Bounded FH1 tile provenance: one configured presented frame only.
-  const int32_t tile_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
-  if (tile_trace_swap > 0 && presented_output_frames_ == uint64_t(tile_trace_swap)) {
+  if (trace_tile) {
     const auto& window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
     const auto& mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
     const auto& scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
@@ -3019,6 +3044,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 // with the explicit unbind the immediate path performs inline.
 bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
                                                const D3D11Fh1NativeResolve::SourceRect& source_rect,
+                                               uint32_t sample_select,
                                                ID3D11UnorderedAccessView* memory_target,
                                                bool use_staging_copy) {
   if (!command_lists_enabled_ || !command_list_ || !native_resolve_ || !source_rect.surface) {
@@ -3028,7 +3054,7 @@ bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
   const D3D11Fh1NativeResolve::SourceRect& source = source_rect;
   // MSAA-safe provenance readback: ResolveSubresource copies the 4x colour
   // surface to a temporary 1x texture without touching the live render path,
-  // then staging reads precisely rows 0..255 for this resolve's source.
+  // then staging reads up to the first 256 host-texture rows.
   if (REXCVAR_GET(fh1_debug_tile_trace_swap) > 0 &&
       presented_output_frames_ == uint64_t(REXCVAR_GET(fh1_debug_tile_trace_swap)) &&
       source.surface && source.surface->texture && source.surface->samples > 1 &&
@@ -3095,7 +3121,7 @@ bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
       resource_state_tracker_->Transition(tape, target_resource.Get(),
                                           D3D11ResourceState::kUnorderedAccess);
     }
-    if (!native_resolve_->RecordResolveMemory(tape, source, plan.resolve_key, plan.sample_select,
+    if (!native_resolve_->RecordResolveMemory(tape, source, plan.resolve_key, sample_select,
                                               plan.dest_info, resolve_dest_base, plan.dest_pitch,
                                               memory_target, true)) {
       // A named skip (pipeline or view creation) leaves no dispatch; drop the
@@ -3547,7 +3573,11 @@ bool D3D11CommandProcessor::IssueCopy() {
   // the registers and run one SM5.0 compute resolve per source surface into
   // the mirror; Phase 5's FH1 native executor takes over the run-ordered
   // passes around it (clears, ownership transfers, scaled targets, readback).
+  const bool trace_band2 = current_draw_band_trace_ && current_draw_tiling_pass_ == 1;
   if (!native_surfaces_ || !native_resolve_) {
+    if (trace_band2) {
+      REXGPU_ERROR("FH1 band2 ERROR: D3D11 resolve unavailable (native surfaces or resolver)");
+    }
     return true;
   }
   const Fh1ResolveFlags flags{host_render_config_->depth_float24_round(),
@@ -3555,8 +3585,40 @@ bool D3D11CommandProcessor::IssueCopy() {
                               host_render_config_->IsFixed16TruncatedToMinus1To1()};
   Fh1ResolvePlan plan;
   if (!Fh1PlanResolve(*register_file_, *memory_, flags, plan)) {
+    if (trace_band2) {
+      const RegisterFile& regs = *register_file_;
+      const auto fetch = regs.GetVertexFetch(0);
+      const auto copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+      const auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+      const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      const auto mode_control = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+      REXGPU_ERROR(
+          "FH1 band2 ERROR: D3D11 resolve planning failed failure_id={} swap={} call={} "
+          "pass={} window_y={} "
+          "vtx_window_offset={} fetch_type={} fetch_size={} fetch_address={:08X} "
+          "fetch_endian={} copy_control={:08X} copy_src={} surface_info={:08X} "
+          "depth_info={:08X} color_info_0={:08X} dest_base={:08X} dest_pitch={:08X} "
+          "dest_info={:08X} empty={}",
+          uint32_t(plan.failure), presented_output_frames_, resolve_call_count_,
+          current_draw_tiling_pass_, int32_t(window_offset.window_y_offset),
+          mode_control.vtx_window_offset_enable, uint32_t(fetch.type), fetch.size, fetch.address,
+          uint32_t(fetch.endian), copy_control.value, uint32_t(copy_control.copy_src_select),
+          surface_info.value, depth_info.value, regs[XE_GPU_REG_RB_COLOR_INFO],
+          regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
+          regs[XE_GPU_REG_RB_COPY_DEST_INFO], plan.empty);
+    }
     // Nothing to copy or clear: Xenos does no work either.
     return plan.empty;
+  }
+  if (trace_band2) {
+    REXGPU_INFO(
+        "FH1 band2: D3D11 resolve plan call={} copy={} skip={} rect={},{}-{},{} "
+        "dest={:08X} extent={:08X}+{} key={} window_y={}",
+        resolve_call_count_, plan.copy ? 1 : 0, plan.skip ? plan.skip : "none", plan.x0, plan.y0,
+        plan.x1, plan.y1, plan.dest_base, plan.info.copy_dest_extent_start,
+        plan.info.copy_dest_extent_length, plan.resolve_key.Describe(),
+        int32_t(register_file_->Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset));
   }
   const bool resolve_clear_requested =
       plan.info.IsClearingColor() || plan.info.IsClearingDepth();
@@ -3977,6 +4039,96 @@ bool D3D11CommandProcessor::IssueCopy() {
                                      presented_output_frames_ == uint64_t(minimap_swap);
   bool complete = false;
   bool any_resolved = false;
+  uint32_t owner_segments_succeeded = 0;
+  bool owner_batch_submit_ok = true;
+  const bool staging_copy_required = use_staging_copy;
+  const uint32_t resolve_dest_base =
+      use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
+  // D3D11's normal EDRAM-sized surfaces rasterize each window-offset band at
+  // source Y=0; unlike Vulkan's optional untile-height surfaces, no extra row
+  // band is stored past the EDRAM surface. Keep the shader's upper-half row
+  // offset explicit and zero for this path.
+  const uint32_t source_row_offset = 0;
+  const uint32_t resolve_sample_select =
+      (plan.sample_select & 0xFFFFu) | (source_row_offset << 16);
+  bool trace_resolve = false;
+  std::unique_ptr<std::FILE, decltype(&std::fclose)> resolve_trace_file(nullptr, &std::fclose);
+  static uint32_t trace_captures = 0;
+  static uint64_t selected_trace_swap = UINT64_MAX;
+  static uint32_t selected_trace_captures = 0;
+  if (selected_trace_swap != presented_output_frames_) {
+    selected_trace_swap = presented_output_frames_;
+    selected_trace_captures = 0;
+  }
+  const int32_t trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+  const bool selected_swap_resolve_trace =
+      trace_swap > 0 && presented_output_frames_ == uint64_t(trace_swap) && !plan.copying_depth &&
+      plan.info.copy_dest_extent_length >= (1u << 20) && selected_trace_captures < 3;
+  const uint32_t trace_width = uint32_t(source.rect.right - source.rect.left);
+  const uint32_t trace_height = uint32_t(source.rect.bottom - source.rect.top);
+  const bool general_resolve_trace =
+      REXCVAR_GET(pinyon_resolve_trace) && trace_captures < 3 &&
+      uint64_t(trace_width) * trace_height >= 100000u;
+  if (selected_swap_resolve_trace || general_resolve_trace) {
+    resolve_trace_file.reset(
+        std::fopen("E:/PinyonShift/work/.local/resolve-trace.log", "a"));
+    if (resolve_trace_file) {
+      trace_resolve = true;
+      selected_trace_captures += selected_swap_resolve_trace ? 1u : 0u;
+      trace_captures += general_resolve_trace ? 1u : 0u;
+    } else {
+      REXGPU_WARN(
+          "FH1 resolve trace: could not open E:/PinyonShift/work/.local/resolve-trace.log");
+    }
+  }
+  auto trace_resolve_line = [&](const std::string& line) {
+    if (!resolve_trace_file) return;
+    std::fwrite(line.data(), 1, line.size(), resolve_trace_file.get());
+    std::fputc('\n', resolve_trace_file.get());
+  };
+  if (trace_resolve) {
+    const auto window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    const auto mode_cntl = register_file_->Get<reg::PA_SU_SC_MODE_CNTL>();
+    D3D11_TEXTURE2D_DESC source_desc{};
+    if (source.surface && source.surface->texture) {
+      source.surface->texture->GetDesc(&source_desc);
+    }
+    trace_resolve_line(fmt::format(
+        "RESOLVE swap={} call={} base=0x{:X} pitch={} extent=0x{:X}+{} rect={},{}-{},{} "
+        "dest_info=0x{:X} sample_select=0x{:X} source_row_offset={} pass={} "
+        "resolve_key={} source_key={} source_guest_size={}x{} source_host_size={}x{} "
+        "samples={} window_y={} "
+        "vtx_window_offset_enable={} readback=ResolveSubresource",
+        presented_output_frames_, resolve_call_count_, plan.dest_base, plan.dest_pitch,
+        plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length, plan.x0, plan.y0,
+        plan.x1, plan.y1, plan.dest_info, resolve_sample_select, source_row_offset,
+        current_draw_tiling_pass_,
+        plan.resolve_key.Describe(),
+        source.surface ? source.surface->key.Describe() : "none",
+        source.surface ? Fh1D3D11SurfaceWidth(source.surface->key) : 0u,
+        source.surface ? Fh1D3D11SurfaceHeight(source.surface->key, 1) : 0u,
+        source_desc.Width, source_desc.Height, source_desc.SampleDesc.Count,
+        int32_t(window_offset.window_y_offset), mode_cntl.vtx_window_offset_enable));
+    for (size_t i = 0; i < resolve_sources.size(); ++i) {
+      const auto& region = resolve_sources[i];
+      D3D11_TEXTURE2D_DESC region_desc{};
+      if (region.surface && region.surface->texture) {
+        region.surface->texture->GetDesc(&region_desc);
+      }
+      trace_resolve_line(fmt::format(
+          "OWNER call={} index={} key={} rect={},{}-{},{} guest_size={}x{} host_size={}x{} "
+          "samples={} format={} source_guest_rows=[{}, {}) source_row_offset={}",
+          resolve_call_count_, i,
+          region.surface ? region.surface->key.Describe() : "missing", region.rect.left,
+          region.rect.top, region.rect.right, region.rect.bottom,
+          region.surface ? Fh1D3D11SurfaceWidth(region.surface->key) : 0u,
+          region.surface ? Fh1D3D11SurfaceHeight(region.surface->key, 1) : 0u,
+          region_desc.Width, region_desc.Height, region_desc.SampleDesc.Count,
+          uint32_t(region_desc.Format), region.rect.top + int32_t(source_row_offset),
+          region.rect.bottom + int32_t(source_row_offset), source_row_offset));
+    }
+    if (resolve_trace_file) std::fflush(resolve_trace_file.get());
+  }
   if (source.rect.left < source.rect.right && source.rect.top < source.rect.bottom) {
     if (command_lists_enabled_) {
       // Phase 3 M2: the same plan, recorded as a packet batch and replayed
@@ -3986,15 +4138,26 @@ bool D3D11CommandProcessor::IssueCopy() {
       for (const D3D11Fh1NativeResolve::SourceRect& region : resolve_sources) {
         if (!region.surface) {
           complete = false;
+          if (trace_resolve) {
+            trace_resolve_line(fmt::format("OWNER_RESULT call={} mode=recorded success=0",
+                                           resolve_call_count_));
+          }
           continue;
         }
-        const bool recorded =
-            RecordResolveBatch(plan, region, memory_target, use_staging_copy);
+        const bool recorded = RecordResolveBatch(plan, region, resolve_sample_select,
+                                                 memory_target, use_staging_copy);
         any_resolved |= recorded;
         complete &= recorded;
+        owner_segments_succeeded += recorded;
+        if (trace_resolve) {
+          trace_resolve_line(fmt::format("OWNER_RESULT call={} mode=recorded key={} success={}",
+                                         resolve_call_count_, region.surface->key.Describe(),
+                                         recorded));
+        }
       }
       if (any_resolved) {
-        complete &= SubmitFrameTape("resolve dispatch");
+        owner_batch_submit_ok = SubmitFrameTape("resolve dispatch");
+        complete &= owner_batch_submit_ok;
       }
     } else {
       if (capture_minimap_frame && !plan.copying_depth && source.surface && source.surface->texture &&
@@ -4062,32 +4225,6 @@ bool D3D11CommandProcessor::IssueCopy() {
       // Into the staging buffer the destination is relative to the extent's
       // start (which is where the copy into the mirror begins); into the mirror
       // itself it is the guest byte address the shader's layout math expects.
-      const uint32_t resolve_dest_base =
-          use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
-      if (REXCVAR_GET(pinyon_resolve_trace)) {
-        static uint32_t trace_logs = 0;
-        const uint32_t trace_width = uint32_t(source.rect.right - source.rect.left);
-        const uint32_t trace_height = uint32_t(source.rect.bottom - source.rect.top);
-        if (trace_logs < 600 && trace_width * trace_height >= 100000u &&
-            (trace_logs % 3) == 0) {
-          ++trace_logs;
-          std::FILE* trace_file = std::fopen("E:/PinyonShift/work/.local/resolve-trace.log", "a");
-          if (trace_file) {
-            std::fprintf(trace_file,
-                         "RESOLVE src=%ux%u+%u+%u dest_base=0x%X pitch=%u pack=%u endian=%u swap=%u "
-                         "scale=%u unscaled=%u extent=0x%X len=%u samples=%u\n",
-                         trace_width, trace_height, uint32_t(source.rect.left),
-                         uint32_t(source.rect.top), plan.dest_base, plan.dest_pitch,
-                         plan.dest_info & 7u, (plan.dest_info >> 3u) & 7u,
-                         (plan.dest_info >> 6u) & 1u, (plan.dest_info >> 20u) & 3u,
-                         (plan.dest_info >> 22u) & 1u, plan.info.copy_dest_extent_start,
-                         plan.info.copy_dest_extent_length,
-                         uint32_t(source.surface ? source.surface->samples : 0));
-            std::fflush(trace_file);
-            std::fclose(trace_file);
-          }
-        }
-      }
       if (REXCVAR_GET(pinyon_audit)) {
         rex::graphics::render_audit::NoteResolve(
             uint32_t(source.rect.right - source.rect.left),
@@ -4099,16 +4236,27 @@ bool D3D11CommandProcessor::IssueCopy() {
       for (const D3D11Fh1NativeResolve::SourceRect& region : resolve_sources) {
         if (!region.surface) {
           complete = false;
+          if (trace_resolve) {
+            trace_resolve_line(fmt::format("OWNER_RESULT call={} mode=immediate success=0",
+                                           resolve_call_count_));
+          }
           continue;
         }
         const bool resolved = native_resolve_->ResolveToMemory(
-            region, plan.resolve_key, plan.sample_select, plan.dest_info, resolve_dest_base,
+            region, plan.resolve_key, resolve_sample_select, plan.dest_info, resolve_dest_base,
             plan.dest_pitch, memory_target, true);
         any_resolved |= resolved;
         complete &= resolved;
+        owner_segments_succeeded += resolved;
+        if (trace_resolve) {
+          trace_resolve_line(fmt::format("OWNER_RESULT call={} mode=immediate key={} success={}",
+                                         resolve_call_count_, region.surface->key.Describe(),
+                                         resolved));
+        }
       }
     }
   }
+  bool staging_copy_ok = !staging_copy_required;
   if ((complete || any_resolved) && use_staging_copy) {
     const bool capture_minimap_candidate = capture_minimap_frame && !plan.copying_depth &&
         plan.x1 - plan.x0 >= 256 && plan.x1 - plan.x0 <= 512 &&
@@ -4612,7 +4760,7 @@ bool D3D11CommandProcessor::IssueCopy() {
       rex::graphics::render_audit::NotePassResolve(
           plan.kind.c_str(), plan.x0, plan.y0, plan.x1, plan.y1,
           plan.resolve_key.Describe().c_str(), pass_src_w, pass_src_h,
-          uint32_t(source.surface ? source.surface->samples : 0), plan.sample_select,
+          uint32_t(source.surface ? source.surface->samples : 0), resolve_sample_select,
           plan.dest_base, plan.dest_pitch, plan.dest_info, pass_src_rows, pass_evidence,
           pass_hw_rows, pass_dst_rows);
     }
@@ -4730,7 +4878,7 @@ bool D3D11CommandProcessor::IssueCopy() {
           mirror_hash(plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length,
                       tape_mirror_hash, tape_mirror_nonzero);
       const bool immediate_ok =
-          native_resolve_->ResolveToMemory(source, plan.resolve_key, plan.sample_select,
+          native_resolve_->ResolveToMemory(source, plan.resolve_key, resolve_sample_select,
                                            plan.dest_info, ab_dest_base, plan.dest_pitch,
                                            memory_target, true);
       WaitForGpu();
@@ -4782,7 +4930,7 @@ bool D3D11CommandProcessor::IssueCopy() {
     // the destination offset relative to the extent's start, which is exactly
     // what the staging buffer holds from offset 0. The recorded path appends
     // the copy as a packet and replays it in order after the dispatch.
-    const bool staging_copy_ok =
+    staging_copy_ok =
         command_lists_enabled_
             ? (RecordResolveStagingCopy(plan.info.copy_dest_extent_start,
                                         plan.info.copy_dest_extent_length) &&
@@ -4798,6 +4946,125 @@ bool D3D11CommandProcessor::IssueCopy() {
                      plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length);
       }
     }
+  }
+  bool trace_gpu_completed = false;
+  if (trace_resolve) {
+    trace_gpu_completed = WaitForGpu();
+    trace_resolve_line(fmt::format(
+        "COMPLETE call={} owner_segments={} succeeded={} all_succeeded={} recorded={} "
+        "recorded_submit_ok={} resolve_complete={} staging_copy_required={} staging_copy_ok={} "
+        "gpu_wait={}",
+        resolve_call_count_, uint32_t(resolve_sources.size()), owner_segments_succeeded,
+        owner_segments_succeeded == resolve_sources.size(), command_lists_enabled_,
+        owner_batch_submit_ok, complete, staging_copy_required, staging_copy_ok,
+        trace_gpu_completed));
+    if (trace_gpu_completed) {
+      std::set<uint32_t> captured_surfaces;
+      ID3D11Device* trace_device = GetD3D11Provider().GetDevice();
+      ID3D11DeviceContext* trace_context = GetD3D11Provider().GetImmediateContext();
+      for (const auto& region : resolve_sources) {
+        if (!region.surface || !region.surface->texture ||
+            !captured_surfaces.insert(region.surface->key.Pack()).second) {
+          continue;
+        }
+        std::vector<uint8_t> source_rgb;
+        uint32_t source_width = 0, source_height = 0;
+        SurfaceDumpStats source_stats;
+        std::string source_error;
+        if (!ReadSurfaceRgb(trace_device, trace_context, region.surface, source_rgb,
+                            source_width, source_height, source_stats, source_error)) {
+          trace_resolve_line(fmt::format(
+              "SOURCE call={} key={} capture_failed={}", resolve_call_count_,
+              region.surface->key.Describe(), source_error));
+          continue;
+        }
+        const uint32_t rows =
+            selected_swap_resolve_trace ? source_height : std::min(source_height, 512u);
+        std::vector<uint64_t> row_hashes;
+        const uint64_t source_rgb_hash =
+            HashRows(source_rgb.data(), source_width * 3u, rows, source_width * 3u, &row_hashes);
+        trace_resolve_line(fmt::format(
+            "SOURCE call={} key={} guest_size={}x{} host_size={}x{} host_rows=0..{} "
+            "rgb_hash={:016X}",
+            resolve_call_count_, region.surface->key.Describe(),
+            Fh1D3D11SurfaceWidth(region.surface->key),
+            Fh1D3D11SurfaceHeight(region.surface->key, 1), source_width, source_height,
+            rows ? rows - 1 : 0, source_rgb_hash));
+        for (uint32_t row = 0; row < rows; row += 16) {
+          const uint32_t end = std::min(row + 16u, rows);
+          uint64_t band_hash = UINT64_C(1469598103934665603);
+          for (uint32_t y = row; y < end; ++y) {
+            for (uint32_t byte = 0; byte < sizeof(uint64_t); ++byte) {
+              band_hash = (band_hash ^ uint8_t(row_hashes[y] >> (byte * 8u))) *
+                          UINT64_C(1099511628211);
+            }
+          }
+          trace_resolve_line(fmt::format(
+              "SOURCE_ROWS call={} key={} host_rows={}..{} hash={:016X}",
+              resolve_call_count_, region.surface->key.Describe(), row, end - 1, band_hash));
+        }
+      }
+      constexpr uint32_t kMaxTraceResolveBytes = 64u << 20;
+      const uint32_t length = plan.info.copy_dest_extent_length;
+      if (length && length <= kMaxTraceResolveBytes) {
+        std::vector<uint8_t> mirror_bytes(length);
+        const bool mirror_read = upload_sink->ReadbackFromHostBuffer(
+            plan.info.copy_dest_extent_start, mirror_bytes.data(), length);
+        uint64_t mirror_hash_value = UINT64_C(1469598103934665603);
+        uint64_t mirror_nonzero = 0;
+        if (mirror_read) {
+          for (uint32_t i = 0; i < length; ++i) {
+            mirror_hash_value = (mirror_hash_value ^ mirror_bytes[i]) *
+                                UINT64_C(1099511628211);
+            mirror_nonzero += mirror_bytes[i] != 0;
+          }
+        }
+        bool staging_read = false;
+        bool staging_matches_mirror = false;
+        if (use_staging_copy) {
+          std::vector<uint8_t> staging_bytes(length);
+          staging_read =
+              upload_sink->ReadbackResolveStaging(0, staging_bytes.data(), length);
+          staging_matches_mirror =
+              staging_read && mirror_read &&
+              std::memcmp(staging_bytes.data(), mirror_bytes.data(), length) == 0;
+        }
+        trace_resolve_line(fmt::format(
+            "MIRROR call={} range=0x{:X}+{} read={} hash={:016X} nonzero_bytes={} "
+            "staging_read={} staging_matches_mirror={}",
+            resolve_call_count_, plan.info.copy_dest_extent_start, length, mirror_read,
+            mirror_hash_value, mirror_nonzero, staging_read, staging_matches_mirror));
+        if (selected_swap_resolve_trace && mirror_read) {
+          const uint32_t bytes_per_pixel_log2 = (plan.dest_info >> 16) & 3u;
+          const uint64_t row_bytes = uint64_t(plan.dest_pitch) << bytes_per_pixel_log2;
+          if (row_bytes && row_bytes <= length) {
+            const uint32_t row_count = uint32_t((uint64_t(length) + row_bytes - 1) / row_bytes);
+            for (uint32_t row = 0; row < row_count; row += 16) {
+              const uint64_t begin = uint64_t(row) * row_bytes;
+              const uint64_t end =
+                  std::min<uint64_t>(length, uint64_t(row + 16) * row_bytes);
+              uint64_t row_hash = UINT64_C(1469598103934665603);
+              for (uint64_t byte = begin; byte < end; ++byte) {
+                row_hash = (row_hash ^ mirror_bytes[size_t(byte)]) * UINT64_C(1099511628211);
+              }
+              trace_resolve_line(fmt::format(
+                  "MIRROR_ROWS call={} origin=0x{:X} rows={}..{} row_bytes={} hash={:016X}",
+                  resolve_call_count_, plan.info.copy_dest_extent_start, row,
+                  std::min(row + 15u, row_count - 1u), row_bytes, row_hash));
+            }
+          } else {
+            trace_resolve_line(fmt::format(
+                "MIRROR_ROWS call={} unavailable dest_pitch={} bpp_log2={} length={}",
+                resolve_call_count_, plan.dest_pitch, bytes_per_pixel_log2, length));
+          }
+        }
+      } else {
+        trace_resolve_line(fmt::format("MIRROR call={} range=0x{:X}+{} read=skipped",
+                                       resolve_call_count_, plan.info.copy_dest_extent_start,
+                                       length));
+      }
+    }
+    if (resolve_trace_file) std::fflush(resolve_trace_file.get());
   }
   if (complete && REXCVAR_GET(fh1_debug_resolve_store_probe)) {
     WaitForGpu();
@@ -4884,6 +5151,14 @@ bool D3D11CommandProcessor::IssueCopy() {
         probe_nonzero);
   }
   const bool resolve_complete = complete;
+  if (trace_resolve) {
+    trace_resolve_line(fmt::format(
+        "CLEAR_ORDER call={} clear_requested={} owner_segments={} succeeded={} "
+        "all_succeeded={} resolve_complete={} recorded_submit_ok={} gpu_wait={}",
+        resolve_call_count_, resolve_clear_requested, uint32_t(resolve_sources.size()),
+        owner_segments_succeeded, owner_segments_succeeded == resolve_sources.size(),
+        resolve_complete, owner_batch_submit_ok, trace_gpu_completed));
+  }
   complete &= apply_resolve_clears();
   if (resolve_complete && !small_uav_probe && window_probe_mb <= 0) {
     texture_cache_->MarkRangeAsResolved(plan.info.copy_dest_extent_start,
