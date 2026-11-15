@@ -156,6 +156,11 @@ class D3D11Fh1NativeExecutor {
   // After the command processor issued the draw.
   void NativeDrawIssued(const Fh1DrawInfo& draw);
 
+  // A resolve-time clear: the guest clears tiles and then clears the native
+  // surface over the same rectangle, without a transfer of previous content.
+  void ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
+                    uint32_t clear_value, uint32_t clear_value_lo);
+
   // After a resolve read its source through ResolveSourceOwner.
   void OwnerResolveIssued() { ++owner_resolves_; }
 

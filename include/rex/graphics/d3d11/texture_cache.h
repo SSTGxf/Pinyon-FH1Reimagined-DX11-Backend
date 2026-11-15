@@ -83,6 +83,7 @@ class D3D11TextureCache final : public TextureCache {
   ID3D11Texture2D* FindAnyTexture2DForGuestBase(uint32_t guest_base, DXGI_FORMAT& read_format_out,
                                                 uint32_t& width_out, uint32_t& height_out,
                                                 uint32_t& host_format_out);
+  void LogMinimapSampledTexture(uint32_t fetch_constant_index, uint64_t frame);
 
   // Sampler parameters that can be directly converted to a host sampler.
   union SamplerParameters {
@@ -184,6 +185,7 @@ class D3D11TextureCache final : public TextureCache {
 
   // fh1_debug_presented_pair reads this after the swap's upload.
   ID3D11Resource* swap_resource_ = nullptr;
+  uint64_t minimap_capture_sampled_frame_ = UINT64_MAX;
 
   // RequestSwapTexture explains the first failed frontbuffer request once.
   bool swap_request_logged_ = false;

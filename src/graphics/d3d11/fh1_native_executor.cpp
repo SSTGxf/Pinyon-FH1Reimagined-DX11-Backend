@@ -1985,6 +1985,93 @@ std::map<uint32_t, uint32_t> D3D11Fh1NativeExecutor::EnumerateResolveOwners(
   return owners;
 }
 
+void D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0,
+                                           int32_t x1, int32_t y1, uint32_t clear_value,
+                                           uint32_t clear_value_lo) {
+  if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
+    return;
+  }
+  D3D11Fh1NativeSurface* surface = config_.surfaces->GetOrCreateSurface(key);
+  if (!surface) {
+    return;
+  }
+  const uint32_t msaa_x_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k4X));
+  const uint32_t msaa_y_log2 = uint32_t(key.msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> msaa_x_log2;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples >> msaa_y_log2;
+  const uint32_t pitch = key.pitch_tiles;
+  const uint32_t column_first = uint32_t(x0) / tile_width;
+  const uint32_t column_end = (uint32_t(x1) + tile_width - 1) / tile_width;
+  const uint32_t row_first = uint32_t(y0) / tile_height;
+  const uint32_t row_end = (uint32_t(y1) + tile_height - 1) / tile_height;
+
+  for (uint32_t row = row_first; row < row_end; ++row) {
+    const uint32_t row_base = key.base_tiles + row * pitch + column_first;
+    for (uint32_t column = column_first; column < column_end; ++column) {
+      tiles_.Claim(row_base + column - column_first, 1, key.Pack(), false);
+    }
+    if (key.is_depth) {
+      tiles_.MarkStencil(row_base, column_end - column_first, (clear_value & 0xFF) != 0);
+    }
+  }
+
+  const RECT rect = {LONG(x0), LONG(y0), LONG(x1), LONG(y1)};
+  auto* context = command_processor_.GetD3D11Provider().GetImmediateContext();
+  if (key.is_depth) {
+    const uint32_t depth_bits = (clear_value >> 8) & 0xFFFFFF;
+    const float value = xenos::DepthRenderTargetFormat(key.format) ==
+                                xenos::DepthRenderTargetFormat::kD24FS8
+                            ? xenos::Float20e4To32(depth_bits) * 0.5f
+                            : xenos::UNorm24To32(depth_bits);
+    surface->stencil_nonzero = (clear_value & 0xFF) != 0;
+    context->ClearDepthStencilView(surface->dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, value,
+                                   uint8_t(clear_value & 0xFF));
+  } else {
+    float color[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    switch (xenos::ColorRenderTargetFormat(key.format)) {
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8:
+      case xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
+        for (uint32_t i = 0; i < 4; ++i) color[i] = float((clear_value >> (8 * i)) & 0xFF) / 255.0f;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10:
+        for (uint32_t i = 0; i < 3; ++i) color[i] = float((clear_value >> (10 * i)) & 0x3FF) / 1023.0f;
+        color[3] = float(clear_value >> 30) / 3.0f;
+        break;
+      case xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
+        for (uint32_t i = 0; i < 3; ++i) color[i] = xenos::Float7e3To32((clear_value >> (10 * i)) & 0x3FF);
+        color[3] = float(clear_value >> 30) / 3.0f;
+        break;
+      case xenos::ColorRenderTargetFormat::k_32_FLOAT:
+        std::memcpy(&color[0], &clear_value, sizeof(float));
+        break;
+      case xenos::ColorRenderTargetFormat::k_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16:
+      case xenos::ColorRenderTargetFormat::k_16_16_FLOAT:
+      case xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT: {
+        const bool is_float = key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_FLOAT) ||
+                              key.format == uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT);
+        const uint32_t words[2] = {key.Is64bpp() ? clear_value_lo : clear_value, clear_value};
+        for (uint32_t i = 0; i < (key.Is64bpp() ? 4u : 2u); ++i) {
+          const uint16_t bits = uint16_t(words[i >> 1] >> (16 * (i & 1)));
+          color[i] = is_float ? std::bit_cast<float>(uint32_t(bits))
+                              : std::max(float(int16_t(bits)) / 32767.0f, -1.0f);
+        }
+        break;
+      }
+      case xenos::ColorRenderTargetFormat::k_32_32_FLOAT:
+        std::memcpy(&color[0], &clear_value_lo, sizeof(float));
+        std::memcpy(&color[1], &clear_value, sizeof(float));
+        break;
+      default:
+        if (clear_value || clear_value_lo) {
+          return;
+        }
+        break;
+    }
+    context->ClearRenderTargetView(surface->rtv, color);
+  }
+}
+
 void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
   if (!initialized_) {
     return;

@@ -41,6 +41,9 @@ REXCVAR_DECLARE(int32_t, fh1_debug_frontbuffer_draws_from);
 // does not force every translation unit that includes flags.h to rebuild.
 REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_mode);
 REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_from_swap);
+REXCVAR_DECLARE(bool, fh1_debug_disable_msaa);
+REXCVAR_DECLARE(int32_t, fh1_debug_tile_trace_swap);
+REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
 #include <rex/graphics/d3d11/fh1_native_surfaces.h>
 #include <rex/graphics/d3d11/graphics_system.h>
 #include <rex/graphics/d3d11/host_render_config.h>
@@ -134,6 +137,27 @@ struct SurfaceDumpStats {
   uint32_t distinct = 0;
   double mean[3] = {};
 };
+
+uint64_t HashRows(const uint8_t* bytes, uint32_t row_pitch, uint32_t rows,
+                  uint32_t row_bytes, std::vector<uint64_t>* row_hashes) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  if (row_hashes) {
+    row_hashes->clear();
+    row_hashes->reserve(rows);
+  }
+  for (uint32_t y = 0; y < rows; ++y) {
+    const uint8_t* row = bytes + size_t(row_pitch) * y;
+    uint64_t row_hash = UINT64_C(1469598103934665603);
+    for (uint32_t x = 0; x < row_bytes; ++x) {
+      row_hash = (row_hash ^ row[x]) * UINT64_C(1099511628211);
+      hash = (hash ^ row[x]) * UINT64_C(1099511628211);
+    }
+    if (row_hashes) {
+      row_hashes->push_back(row_hash);
+    }
+  }
+  return hash;
+}
 
 // Stages `source` and decodes its pixels into `rgb_out` (three bytes per pixel,
 // row-major, top-down), filling in what the pixels contain. The shared readback
@@ -812,6 +836,19 @@ Shader* D3D11CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 //
 
 void D3D11CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+  if (index == XE_GPU_REG_RB_SURFACE_INFO && REXCVAR_GET(fh1_debug_disable_msaa)) {
+    reg::RB_SURFACE_INFO surface_info;
+    surface_info.value = value;
+    if (surface_info.msaa_samples != xenos::MsaaSamples::k1X) {
+      surface_info.msaa_samples = xenos::MsaaSamples::k1X;
+      value = surface_info.value;
+      static bool logged_override = false;
+      if (!logged_override) {
+        logged_override = true;
+        REXGPU_WARN("D3D11 FH1 diagnostic: forcing RB_SURFACE_INFO to 1x MSAA");
+      }
+    }
+  }
   CommandProcessor::WriteRegister(index, value);
 
   if (index >= XE_GPU_REG_SHADER_CONSTANT_000_X && index <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
@@ -847,6 +884,27 @@ void D3D11CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
                                                   uint32_t num_registers) {
   if (!num_registers) {
     return;
+  }
+  const uint32_t surface_info_index = XE_GPU_REG_RB_SURFACE_INFO;
+  const uint64_t end_index_wide = uint64_t(start_index) + num_registers;
+  if (REXCVAR_GET(fh1_debug_disable_msaa) && start_index <= surface_info_index &&
+      surface_info_index < end_index_wide) {
+    // Most guest register packets take this bulk path, which writes directly
+    // into RegisterFile and never reaches the per-register override above.
+    std::vector<uint32_t> adjusted(base, base + num_registers);
+    const uint32_t offset = surface_info_index - start_index;
+    reg::RB_SURFACE_INFO surface_info;
+    surface_info.value = rex::byte_swap(adjusted[offset]);
+    if (surface_info.msaa_samples != xenos::MsaaSamples::k1X) {
+      surface_info.msaa_samples = xenos::MsaaSamples::k1X;
+      adjusted[offset] = rex::byte_swap(surface_info.value);
+      base = adjusted.data();
+      static bool logged_override = false;
+      if (!logged_override) {
+        logged_override = true;
+        REXGPU_WARN("D3D11 FH1 diagnostic: forcing bulk RB_SURFACE_INFO writes to 1x MSAA");
+      }
+    }
   }
   uint32_t end_index = start_index + num_registers - 1;
 
@@ -1779,6 +1837,23 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                               int32_t(scissor.offset[0] + scissor.extent[0]));
   int32_t claim_y1 = std::min(int32_t(viewport_info.xy_offset[1] + viewport_info.xy_extent[1]),
                               int32_t(scissor.offset[1] + scissor.extent[1]));
+
+  // Bounded FH1 tile provenance: one configured presented frame only.
+  const int32_t tile_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+  if (tile_trace_swap > 0 && presented_output_frames_ == uint64_t(tile_trace_swap)) {
+    const auto& window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    const auto& mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+    const auto& scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    REXGPU_INFO(
+        "FH1 tile draw: swap={} resolve_count={} draw={} window_y={} "
+        "vtx_window_offset_enable={} window_offset_disable={} "
+        "viewport_y={} viewport_h={} scissor_y={} scissor_h={} claim_y={}..{}",
+        presented_output_frames_, resolve_call_count_, draw_counters_.issued,
+        int32_t(window_offset.window_y_offset),
+        mode_cntl.vtx_window_offset_enable, scissor_tl.window_offset_disable,
+        viewport_info.xy_offset[1], viewport_info.xy_extent[1], scissor.offset[1],
+        scissor.extent[1], claim_y0, claim_y1);
+  }
 
   // Bind the native render targets this draw writes.
   uint32_t bound_depth_and_color_render_target_bits = 0;
@@ -2952,6 +3027,56 @@ bool D3D11CommandProcessor::RecordResolveBatch(const Fh1ResolvePlan& plan,
   D3D11CommandList& tape = *command_list_;
   D3D11Fh1NativeResolve::SourceRect source;
   source.surface = source_surface;
+  // MSAA-safe provenance readback: ResolveSubresource copies the 4x colour
+  // surface to a temporary 1x texture without touching the live render path,
+  // then staging reads precisely rows 0..255 for this resolve's source.
+  if (REXCVAR_GET(fh1_debug_tile_trace_swap) > 0 &&
+      presented_output_frames_ == uint64_t(REXCVAR_GET(fh1_debug_tile_trace_swap)) &&
+      source.surface && source.surface->texture && source.surface->samples > 1 &&
+      !plan.copying_depth) {
+    ID3D11Device* device = GetD3D11Provider().GetDevice();
+    ID3D11DeviceContext* context = GetD3D11Provider().GetImmediateContext();
+    D3D11_TEXTURE2D_DESC source_desc;
+    source.surface->texture->GetDesc(&source_desc);
+    D3D11_TEXTURE2D_DESC resolved_desc = source_desc;
+    resolved_desc.SampleDesc.Count = 1;
+    resolved_desc.SampleDesc.Quality = 0;
+    resolved_desc.Usage = D3D11_USAGE_DEFAULT;
+    resolved_desc.BindFlags = 0;
+    resolved_desc.CPUAccessFlags = 0;
+    resolved_desc.MiscFlags = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved_temp;
+    const uint32_t rows = std::min<uint32_t>(256, source_desc.Height);
+    if (SUCCEEDED(device->CreateTexture2D(&resolved_desc, nullptr, &resolved_temp))) {
+      context->ResolveSubresource(resolved_temp.Get(), 0, source.surface->texture, 0,
+                                  source_desc.Format);
+      D3D11_TEXTURE2D_DESC staging_desc = resolved_desc;
+      staging_desc.Height = rows;
+      staging_desc.Usage = D3D11_USAGE_STAGING;
+      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+      if (SUCCEEDED(device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
+        D3D11_BOX box{0, 0, 0, source_desc.Width, rows, 1};
+        context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, resolved_temp.Get(), 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+          uint64_t hash = UINT64_C(1469598103934665603);
+          const auto* bytes = static_cast<const uint8_t*>(mapped.pData);
+          for (uint32_t y = 0; y < rows; ++y) {
+            const auto* row = bytes + size_t(mapped.RowPitch) * y;
+            for (uint32_t x = 0; x < source_desc.Width * 4u; ++x) {
+              hash = (hash ^ row[x]) * UINT64_C(1099511628211);
+            }
+          }
+          REXGPU_INFO("FH1 tile source hash: swap={} resolve_count={} key={} rows=0..{} "
+                      "hash={:016X} samples={} format={}",
+                      presented_output_frames_, resolve_call_count_, source.surface->key.Describe(),
+                      rows, hash, source.surface->samples, uint32_t(source_desc.Format));
+          context->Unmap(staging.Get(), 0);
+        }
+      }
+    }
+  }
   source.rect = {plan.x0, plan.y0, plan.x1, plan.y1};
   const uint32_t resolve_dest_base =
       use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
@@ -3435,7 +3560,53 @@ bool D3D11CommandProcessor::IssueCopy() {
     // Nothing to copy or clear: Xenos does no work either.
     return plan.empty;
   }
+  // Bounded resolve-clear evidence for one selected presented frame. This is
+  // intentionally log-only: D3D11 does not execute the clear here yet.
+  const int32_t clear_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+  if (!plan.empty && clear_trace_swap > 0 &&
+      presented_output_frames_ == uint64_t(clear_trace_swap)) {
+    static uint64_t clear_trace_last_swap = UINT64_MAX;
+    static uint32_t clear_trace_records = 0;
+    if (clear_trace_last_swap != presented_output_frames_) {
+      clear_trace_last_swap = presented_output_frames_;
+      clear_trace_records = 0;
+    }
+    if (clear_trace_records < 256) {
+      ++clear_trace_records;
+      const auto& copy_control = plan.info.rb_copy_control;
+      REXGPU_INFO(
+          "FH1 resolve clear flags: swap={} resolve={} copy={} skip={} kind={} "
+          "rect={},{}-{},{} copy_control={:08X} clear_color={} clear_depth={} "
+          "copying_depth={} color_base={} depth_base={} color_clear={:08X} "
+          "color_clear_lo={:08X} depth_clear={:08X}",
+          presented_output_frames_, resolve_call_count_, plan.copy ? 1 : 0,
+          plan.skip ? plan.skip : "none", plan.kind, plan.x0, plan.y0, plan.x1, plan.y1,
+          copy_control.value, plan.info.IsClearingColor() ? 1 : 0,
+          plan.info.IsClearingDepth() ? 1 : 0, plan.copying_depth ? 1 : 0,
+          uint32_t(plan.color_info.color_base), uint32_t(plan.depth_info.depth_base),
+          plan.info.rb_color_clear,
+          plan.info.rb_color_clear_lo, plan.info.rb_depth_clear);
+    }
+  }
+  // D3D11 resolve-time clears have the same semantics as the D3D12 and Vulkan
+  // executors: the guest clears the EDRAM tiles at the resolve rectangle and the
+  // native surface must be cleared to match before the next pass reads it.
   if (!plan.copy) {
+    if (plan.info.IsClearingColor()) {
+      if (native_executor_) {
+        native_executor_->ResolveClear(Fh1SurfaceKey::Color(plan.color_info.color_base, plan.pitch_tiles, plan.msaa, plan.color_info.color_format, host_render_config_->gamma_render_target_as_unorm16()),
+                                      plan.x0, plan.y0, plan.x1, plan.y1,
+                                      plan.info.rb_color_clear,
+                                      plan.info.rb_color_clear_lo);
+      }
+    }
+    if (plan.info.IsClearingDepth()) {
+      if (native_executor_) {
+        native_executor_->ResolveClear(Fh1SurfaceKey::Depth(plan.depth_info.depth_base, plan.pitch_tiles, plan.msaa, plan.depth_info.depth_format),
+                                      plan.x0, plan.y0, plan.x1, plan.y1,
+                                      plan.info.rb_depth_clear, 0);
+      }
+    }
     REXGPU_WARN("D3D11 FH1 native resolve: skipped ({})", plan.skip ? plan.skip : "unknown");
     return false;
   }
@@ -3776,6 +3947,9 @@ bool D3D11CommandProcessor::IssueCopy() {
       trace_store_probe && mirror_hash(plan.info.copy_dest_extent_start,
                                        plan.info.copy_dest_extent_length, mirror_before_hash,
                                        mirror_before_nonzero);
+  const int32_t minimap_swap = REXCVAR_GET(fh1_debug_minimap_capture_swap);
+  const bool capture_minimap_frame = minimap_swap > 0 &&
+                                     presented_output_frames_ == uint64_t(minimap_swap);
   bool complete = false;
   if (source.rect.left < source.rect.right && source.rect.top < source.rect.bottom) {
     if (command_lists_enabled_) {
@@ -3787,6 +3961,66 @@ bool D3D11CommandProcessor::IssueCopy() {
         SubmitFrameTape("resolve dispatch");
       }
     } else {
+      if (capture_minimap_frame && !plan.copying_depth && source.surface && source.surface->texture &&
+          plan.x1 - plan.x0 >= 256 && plan.x1 - plan.x0 <= 512 &&
+          plan.y1 - plan.y0 >= 128 && plan.y1 - plan.y0 <= 256 && source.surface->samples > 1) {
+        D3D11_TEXTURE2D_DESC source_desc{};
+        source.surface->texture->GetDesc(&source_desc);
+        D3D11_TEXTURE2D_DESC resolved_desc = source_desc;
+        resolved_desc.SampleDesc.Count = 1;
+        resolved_desc.SampleDesc.Quality = 0;
+        resolved_desc.Usage = D3D11_USAGE_DEFAULT;
+        resolved_desc.BindFlags = 0;
+        resolved_desc.CPUAccessFlags = 0;
+        resolved_desc.MiscFlags = 0;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved;
+        D3D11_TEXTURE2D_DESC staging_desc = resolved_desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+        ID3D11Device* capture_device = GetD3D11Provider().GetDevice();
+        ID3D11DeviceContext* capture_context = GetD3D11Provider().GetImmediateContext();
+        HRESULT create_resolved = capture_device->CreateTexture2D(&resolved_desc, nullptr, &resolved);
+        HRESULT create_staging = capture_device->CreateTexture2D(&staging_desc, nullptr, &staging);
+        HRESULT query_result = E_FAIL;
+        if (SUCCEEDED(create_resolved) && SUCCEEDED(create_staging)) {
+          capture_context->ResolveSubresource(resolved.Get(), 0, source.surface->texture, 0,
+                                              source_desc.Format);
+          capture_context->CopyResource(staging.Get(), resolved.Get());
+          D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
+          Microsoft::WRL::ComPtr<ID3D11Query> query;
+          HRESULT create_query = capture_device->CreateQuery(&query_desc, &query);
+          if (SUCCEEDED(create_query)) {
+            capture_context->End(query.Get());
+            capture_context->Flush();
+            while ((query_result = capture_context->GetData(query.Get(), nullptr, 0, 0)) == S_FALSE) {
+              std::this_thread::yield();
+            }
+          }
+          D3D11_MAPPED_SUBRESOURCE mapped{};
+          HRESULT map_result = query_result == S_OK
+                                   ? capture_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)
+                                   : E_FAIL;
+          if (SUCCEEDED(map_result)) {
+            const uint32_t rows = std::min<uint32_t>(source_desc.Height, 256u);
+            std::vector<uint64_t> row_hashes;
+            const uint64_t hash = HashRows(static_cast<const uint8_t*>(mapped.pData), mapped.RowPitch,
+                                           rows, std::min<uint32_t>(mapped.RowPitch, source_desc.Width * 4u),
+                                           &row_hashes);
+            std::string row_text;
+            for (uint32_t row = 0; row < rows; row += 16) {
+              if (!row_text.empty()) row_text += ',';
+              row_text += fmt::format("{}:{:016X}", row, row_hashes[row]);
+            }
+            REXGPU_INFO("FH1 minimap source: swap={} rect={},{}-{},{} source={}x{} stride={} "
+                        "format={} samples={} hash={:016X} rows={}",
+                        presented_output_frames_, plan.x0, plan.y0, plan.x1, plan.y1,
+                        source_desc.Width, source_desc.Height, mapped.RowPitch,
+                        uint32_t(source_desc.Format), source_desc.SampleDesc.Count, hash, row_text);
+            capture_context->Unmap(staging.Get(), 0);
+          }
+        }
+      }
       // The guest-memory mirror is the unscaled destination at any draw scale
       // (the D3D12 executor's unscaled copy pass).
       // Into the staging buffer the destination is relative to the extent's
@@ -3831,6 +4065,82 @@ bool D3D11CommandProcessor::IssueCopy() {
     }
   }
   if (complete && use_staging_copy) {
+    const bool capture_minimap_candidate = capture_minimap_frame && !plan.copying_depth &&
+        plan.x1 - plan.x0 >= 256 && plan.x1 - plan.x0 <= 512 &&
+        plan.y1 - plan.y0 >= 128 && plan.y1 - plan.y0 <= 256 && source.surface &&
+        source.surface->texture;
+    if (capture_minimap_candidate) {
+      D3D11_TEXTURE2D_DESC source_desc{};
+      source.surface->texture->GetDesc(&source_desc);
+      ID3D11Device* capture_device = GetD3D11Provider().GetDevice();
+      ID3D11DeviceContext* capture_context = GetD3D11Provider().GetImmediateContext();
+      D3D11_TEXTURE2D_DESC resolved_desc = source_desc;
+      resolved_desc.SampleDesc.Count = 1;
+      resolved_desc.SampleDesc.Quality = 0;
+      resolved_desc.Usage = D3D11_USAGE_DEFAULT;
+      resolved_desc.BindFlags = 0;
+      resolved_desc.CPUAccessFlags = 0;
+      resolved_desc.MiscFlags = 0;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved;
+      D3D11_TEXTURE2D_DESC staging_desc = resolved_desc;
+      staging_desc.Usage = D3D11_USAGE_STAGING;
+      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+      HRESULT create_resolved = capture_device->CreateTexture2D(&resolved_desc, nullptr, &resolved);
+      HRESULT create_staging = capture_device->CreateTexture2D(&staging_desc, nullptr, &staging);
+      if (SUCCEEDED(create_resolved) && SUCCEEDED(create_staging)) {
+        capture_context->ResolveSubresource(resolved.Get(), 0, source.surface->texture, 0,
+                                            source_desc.Format);
+        capture_context->CopyResource(staging.Get(), resolved.Get());
+        D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
+        Microsoft::WRL::ComPtr<ID3D11Query> query;
+        HRESULT create_query = capture_device->CreateQuery(&query_desc, &query);
+        HRESULT query_result = E_FAIL;
+        if (SUCCEEDED(create_query)) {
+          capture_context->End(query.Get());
+          capture_context->Flush();
+          while ((query_result = capture_context->GetData(query.Get(), nullptr, 0, 0)) == S_FALSE) {
+            std::this_thread::yield();
+          }
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        HRESULT map_result = E_FAIL;
+        if (query_result == S_OK) {
+          map_result = capture_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        }
+        if (SUCCEEDED(map_result)) {
+          const uint32_t width = std::min<uint32_t>(source_desc.Width,
+                                                    mapped.RowPitch / 4u);
+          const uint32_t rows = std::min<uint32_t>(source_desc.Height, 256u);
+          std::vector<uint64_t> row_hashes;
+          const uint64_t hash = HashRows(static_cast<const uint8_t*>(mapped.pData),
+                                         mapped.RowPitch, rows, width * 4u, &row_hashes);
+          std::string row_text;
+          for (uint32_t row = 0; row < rows; row += 16) {
+            if (!row_text.empty()) row_text += ',';
+            row_text += fmt::format("{}:{:016X}", row, row_hashes[row]);
+          }
+          REXGPU_INFO("FH1 minimap source: swap={} rect={},{}-{},{} source={}x{} stride={} "
+                      "format={} samples={} hash={:016X} rows={}",
+                      presented_output_frames_, plan.x0, plan.y0, plan.x1, plan.y1,
+                      source_desc.Width, source_desc.Height, mapped.RowPitch,
+                      uint32_t(source_desc.Format), source_desc.SampleDesc.Count, hash,
+                      row_text);
+          capture_context->Unmap(staging.Get(), 0);
+        } else {
+          REXGPU_WARN("FH1 minimap source capture failed: swap={} create_resolved={} "
+                      "create_staging={} create_query={} query={} map={}",
+                      presented_output_frames_, int32_t(create_resolved), int32_t(create_staging),
+                      int32_t(create_query), int32_t(query_result), int32_t(map_result));
+        }
+      }
+      minimap_capture_resolve_count_ = resolve_call_count_;
+      minimap_capture_guest_base_ = plan.info.copy_dest_extent_start;
+      minimap_capture_guest_pitch_ = plan.dest_pitch;
+      minimap_capture_guest_width_ = uint32_t(plan.x1 - plan.x0);
+      minimap_capture_guest_height_ = uint32_t(plan.y1 - plan.y0);
+      minimap_capture_resolved_ = true;
+    }
     // Gate the expensive measurement (WaitForGpu + staging readbacks) to the
     // pass window: without this it runs on every resolve of a visible run and
     // chokes the present path black. SetDrawGeo/NoteDrawSubmission above stay
@@ -4610,6 +4920,31 @@ bool D3D11CommandProcessor::RefreshResolvedGuestRange(uint32_t start, uint32_t l
     return false;
   }
   shared_memory_->CopyResolvedRangeToGuest(start, resolve_readback_scratch_.data(), length);
+  if (minimap_capture_resolved_ &&
+      presented_output_frames_ == uint64_t(REXCVAR_GET(fh1_debug_minimap_capture_swap)) &&
+      start <= minimap_capture_guest_base_ &&
+      minimap_capture_guest_base_ - start < length) {
+    const uint32_t offset = minimap_capture_guest_base_ - start;
+    const uint32_t available = length - offset;
+    const uint32_t row_stride = minimap_capture_guest_pitch_;
+    const uint32_t rows = row_stride ? std::min(minimap_capture_guest_height_, available / row_stride) : 0;
+    std::vector<uint64_t> row_hashes;
+    const uint64_t hash = row_stride && rows
+                              ? HashRows(resolve_readback_scratch_.data() + offset, row_stride,
+                                         rows, std::min(row_stride, available), &row_hashes)
+                              : 0;
+    std::string row_text;
+    for (uint32_t row = 0; row < rows; row += 16) {
+      if (!row_text.empty()) row_text += ',';
+      row_text += fmt::format("{}:{:016X}", row, row_hashes[row]);
+    }
+    REXGPU_INFO("FH1 minimap guest: swap={} base={:08X} copied_start={:08X} copied_extent={} "
+                "offset={} stride={} rows={} width={} height={} hash={:016X} rows={}",
+                presented_output_frames_, minimap_capture_guest_base_, start, length, offset,
+                row_stride, rows, minimap_capture_guest_width_, minimap_capture_guest_height_,
+                hash, row_text);
+    minimap_capture_resolved_ = false;
+  }
   const auto gpu_written_after = shared_memory_->CountValidPages(start, length).second;
   ++resolve_refresh_count_;
   resolve_refresh_bytes_ += length;

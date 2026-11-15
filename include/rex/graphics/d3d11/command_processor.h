@@ -261,6 +261,12 @@ class D3D11CommandProcessor : public CommandProcessor {
   uint64_t last_resolve_swap_ = 0;
   bool has_last_resolve_ = false;
   uint64_t resolve_call_count_ = 0;
+  uint64_t minimap_capture_resolve_count_ = 0;
+  uint32_t minimap_capture_guest_base_ = 0;
+  uint32_t minimap_capture_guest_pitch_ = 0;
+  uint32_t minimap_capture_guest_width_ = 0;
+  uint32_t minimap_capture_guest_height_ = 0;
+  bool minimap_capture_resolved_ = false;
   // Every surface identity the draw path has bound as a render target, so the
   // resolve trace can say whether the surface a resolve reads was ever drawn
   // into (the answer separates "empty source" from "wrong surface").

@@ -899,6 +899,74 @@ ID3D11Texture2D* D3D11TextureCache::FindTexture2DForGuestBase(uint32_t guest_bas
   return nullptr;
 }
 
+void D3D11TextureCache::LogMinimapSampledTexture(uint32_t fetch_constant_index, uint64_t frame) {
+  if (REXCVAR_GET(fh1_debug_minimap_capture_swap) <= 0 ||
+      frame != uint64_t(REXCVAR_GET(fh1_debug_minimap_capture_swap)) ||
+      minimap_capture_sampled_frame_ == frame) {
+    return;
+  }
+  const xenos::xe_gpu_texture_fetch_t fetch = register_file().GetTextureFetch(fetch_constant_index);
+  TextureKey key;
+  BindingInfoFromFetchConstant(fetch, key, nullptr);
+  if (!key.is_valid || key.base_page == 0 || key.dimension != xenos::DataDimension::k2DOrStacked ||
+      uint32_t(fetch.size_2d.width) + 1 < 256 || uint32_t(fetch.size_2d.width) + 1 > 512 ||
+      uint32_t(fetch.size_2d.height) + 1 < 128 || uint32_t(fetch.size_2d.height) + 1 > 256) {
+    return;
+  }
+  DXGI_FORMAT read_format = DXGI_FORMAT_UNKNOWN;
+  uint32_t width = 0, height = 0;
+  ID3D11Texture2D* texture = FindTexture2DForGuestBase(uint32_t(fetch.base_address) << 12,
+                                                       fetch.format, read_format, width, height);
+  if (!texture) {
+    return;
+  }
+  D3D11_TEXTURE2D_DESC desc{};
+  texture->GetDesc(&desc);
+  D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+  for (Texture* candidate : TexturesAtBase(uint32_t(fetch.base_address) << 12)) {
+    auto* d3d_texture = static_cast<D3D11Texture*>(candidate);
+    if (d3d_texture->resource() == texture && d3d_texture->srv()) {
+      d3d_texture->srv()->GetDesc(&srv_desc);
+      break;
+    }
+  }
+  uint64_t hash = UINT64_C(1469598103934665603);
+  uint32_t row_pitch = 0;
+  uint32_t rows = std::min<uint32_t>(desc.Height, 256u);
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+  D3D11_TEXTURE2D_DESC staging_desc = desc;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.MiscFlags = 0;
+  ID3D11Device* device = command_processor_.GetD3D11Provider().GetDevice();
+  ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
+  if (desc.SampleDesc.Count == 1 && SUCCEEDED(device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
+    context->CopyResource(staging.Get(), texture);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+      row_pitch = mapped.RowPitch;
+      const uint32_t row_bytes = std::min<uint32_t>(row_pitch, desc.Width * 4u);
+      for (uint32_t y = 0; y < rows; ++y) {
+        const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + size_t(row_pitch) * y;
+        for (uint32_t x = 0; x < row_bytes; ++x) {
+          hash = (hash ^ row[x]) * UINT64_C(1099511628211);
+        }
+      }
+      context->Unmap(staging.Get(), 0);
+    }
+  }
+  REXGPU_INFO("FH1 minimap sampled: swap={} slot={} base={:08X} guest={}x{} fmt={} tiled={} "
+              "host={}x{} resource_fmt={} samples={} pitch={} srv_fmt={} srv_dim={} "
+              "readback_stride={} rows={} hash={:016X}",
+              frame, fetch_constant_index, uint32_t(fetch.base_address) << 12,
+              uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1,
+              uint32_t(fetch.format), uint32_t(fetch.tiled), width, height,
+              uint32_t(desc.Format), desc.SampleDesc.Count, desc.Width * 4u,
+              uint32_t(srv_desc.Format), uint32_t(srv_desc.ViewDimension), row_pitch, rows, hash);
+  minimap_capture_sampled_frame_ = frame;
+}
+
 ID3D11Texture2D* D3D11TextureCache::FindAnyTexture2DForGuestBase(uint32_t guest_base,
                                                                 DXGI_FORMAT& read_format_out,
                                                                 uint32_t& width_out,
@@ -991,6 +1059,9 @@ ID3D11ShaderResourceView* D3D11TextureCache::GetActiveTextureBindfulSRV(
   }
   if (!binding || !AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension)) {
     return nullptr;
+  }
+  if (REXCVAR_GET(fh1_debug_minimap_capture_swap) > 0) {
+    LogMinimapSampledTexture(fetch_constant_index, command_processor_.presented_output_frames());
   }
   bool force_special_view = binding->key.dimension == xenos::DataDimension::k3D &&
                             (host_shader_binding.dimension == xenos::FetchOpDimension::k1D ||
