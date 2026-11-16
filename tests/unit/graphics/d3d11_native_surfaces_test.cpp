@@ -29,10 +29,13 @@ using rex::graphics::Fh1SurfaceKey;
 using rex::graphics::d3d11::D3D11HostRenderConfig;
 using rex::graphics::d3d11::Fh1D3D11SampleMask;
 using rex::graphics::d3d11::Fh1D3D11SurfaceHeight;
+using rex::graphics::d3d11::Fh1D3D11SurfaceImageHeight;
 using rex::graphics::d3d11::Fh1D3D11SurfaceSamples;
 using rex::graphics::d3d11::Fh1D3D11SurfaceTilePitch;
 using rex::graphics::d3d11::Fh1D3D11SurfaceTileWidth;
 using rex::graphics::d3d11::Fh1D3D11SurfaceWidth;
+using rex::graphics::d3d11::Fh1D3D11CopyDownRows;
+using rex::graphics::d3d11::Fh1D3D11UntileBand;
 
 namespace {
 
@@ -83,6 +86,29 @@ TEST_CASE("D3D11 native surface height covers the pitch's EDRAM rows, clamped") 
   // No pitch - no surface.
   CHECK(Fh1D3D11SurfaceHeight(MakeColorKey(0, kMsaa1X), 1) == 0);
   (void)kEdramTileCount;
+}
+
+TEST_CASE("D3D11 untile storage expands without changing EDRAM period geometry") {
+  const Fh1SurfaceKey scene_32 = MakeColorKey(32, kMsaa4X);
+  const Fh1SurfaceKey scene_64 = MakeColor64Key(16, kMsaa4X);
+  CHECK(Fh1D3D11SurfaceHeight(scene_32, 1) == 512);
+  CHECK(Fh1D3D11SurfaceHeight(scene_64, 1) == 512);
+  CHECK(Fh1D3D11SurfaceImageHeight(scene_32, 1, 720) == 720);
+  CHECK(Fh1D3D11SurfaceImageHeight(scene_64, 1, 720) == 720);
+  CHECK(Fh1D3D11SurfaceImageHeight(MakeColorKey(16, kMsaa4X), 1, 720) == 1024);
+  CHECK(Fh1D3D11SurfaceImageHeight(scene_32, 2, 720) == 720);
+  CHECK(Fh1D3D11SurfaceImageHeight(scene_32, 0, 720) == 0);
+}
+
+TEST_CASE("D3D11 untile bands map to their screen rows and copy down the last band") {
+  CHECK(Fh1D3D11UntileBand(0) == 0);
+  CHECK(Fh1D3D11UntileBand(-256) == 256);
+  CHECK(Fh1D3D11UntileBand(-512) == 512);
+  CHECK(Fh1D3D11UntileBand(256) == 0);
+  CHECK(Fh1D3D11CopyDownRows(720, 0) == 0);
+  CHECK(Fh1D3D11CopyDownRows(720, 256) == 256);
+  CHECK(Fh1D3D11CopyDownRows(720, 512) == 208);
+  CHECK(Fh1D3D11CopyDownRows(720, 720) == 0);
 }
 
 TEST_CASE("D3D11 native surface sample counts emulate 2x with 4x when needed") {
@@ -170,6 +196,18 @@ TEST_CASE("D3D11 resolve ownership splits mixed and single-owner tile rectangles
   CHECK(single[0].owner == owner_b);
   CHECK(single[0].left == int32_t(tile_width * 2));
   CHECK(single[0].right == int32_t(tile_width * 4));
+
+  tiles.Reset();
+  tiles.Claim(key.base_tiles, 2, owner_a, true);
+  const auto partially_unowned = tiles.SplitByOwner(
+      key.base_tiles, tile_pitch, int32_t(tile_width), int32_t(kEdramTileHeightSamples), 0, 0,
+      int32_t(tile_width * 4), int32_t(kEdramTileHeightSamples));
+  REQUIRE(partially_unowned.size() == 2);
+  CHECK(partially_unowned[0].owner == owner_a);
+  CHECK(partially_unowned[0].right == int32_t(tile_width * 2));
+  CHECK(partially_unowned[1].owner == Fh1EdramTiles::kNoOwner);
+  CHECK(partially_unowned[1].left == int32_t(tile_width * 2));
+  CHECK(partially_unowned[1].right == int32_t(tile_width * 4));
 
   const Fh1SurfaceKey msaa_key = MakeColor64Key(2, kMsaa4X);
   const uint32_t msaa_tile_width = Fh1D3D11SurfaceTileWidth(msaa_key);
