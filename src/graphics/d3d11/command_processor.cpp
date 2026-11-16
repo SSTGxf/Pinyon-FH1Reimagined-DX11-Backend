@@ -253,7 +253,6 @@ bool ReadTexture2DRgb(ID3D11Device* device, ID3D11DeviceContext* context,
   height_out = height;
   return true;
 }
-
 // Writes `rgb` (three bytes per pixel) as a binary PPM.
 bool WriteRgbPpm(const std::string& path, const std::vector<uint8_t>& rgb, uint32_t width,
                  uint32_t height) {
@@ -672,11 +671,17 @@ bool D3D11CommandProcessor::SetupContext() {
     REXGPU_ERROR("D3D11: render target cache initialization failed");
     return false;
   }
+  const int32_t executor_mode = REXCVAR_GET(fh1_native_executor);
+  const uint32_t untile_height =
+      executor_mode != 0 && executor_mode != 2 && draw_resolution_scale_x == 1 &&
+              draw_resolution_scale_y == 1
+          ? kFh1D3D11UntileHeight
+          : 0u;
   // Phase 4: the FH1 native EDRAM surface layer and its SM5.0 resolve path
   // into the guest-memory mirror (the FH1 route owns its render targets -
   // there is no generic render target cache on it, mirroring D3D12).
-  native_surfaces_ =
-      std::make_unique<D3D11Fh1NativeSurfaces>(provider.GetDevice(), *host_render_config_);
+  native_surfaces_ = std::make_unique<D3D11Fh1NativeSurfaces>(
+      provider.GetDevice(), *host_render_config_, untile_height);
   uint32_t resolve_scale = draw_resolution_scale_x;
   if (draw_resolution_scale_y != resolve_scale || resolve_scale > 4) {
     REXGPU_WARN(
@@ -691,13 +696,13 @@ bool D3D11CommandProcessor::SetupContext() {
   // reads. Off by default and fully gated: with fh1_native_executor=0 this block
   // is skipped and no other code path changes.
   {
-    const int32_t executor_mode = REXCVAR_GET(fh1_native_executor);
     if (executor_mode == 2) {
       REXGPU_WARN("D3D11 FH1 native executor: mode 2 is reserved; running with the executor off");
     } else if (executor_mode != 0) {
       D3D11Fh1NativeExecutorConfig executor_config;
       executor_config.gamma_as_unorm16 = host_render_config_->gamma_render_target_as_unorm16();
       executor_config.scale = draw_resolution_scale_x;
+      executor_config.untile_height = native_surfaces_->untile_height();
       executor_config.surfaces = native_surfaces_.get();
       native_executor_ = std::make_unique<D3D11Fh1NativeExecutor>(*this, *register_file_);
       if (!native_executor_->Initialize(executor_config)) {
@@ -1141,6 +1146,16 @@ void D3D11CommandProcessor::UpdateFixedFunctionState(
   viewport.Height = float(viewport_info.xy_extent[1]);
   viewport.MinDepth = viewport_info.z_min;
   viewport.MaxDepth = viewport_info.z_max;
+  const bool untile_tiling = native_executor_ && native_executor_->untile_height();
+  if (untile_tiling) {
+    // D3D11 keeps each pass's guest bin selection; unlike Vulkan's optional
+    // select-all mode, the first pass does not extend its scissor over every
+    // band.
+    const auto& window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    const int32_t untile_rows = -int32_t(window_offset.window_y_offset);
+    viewport.TopLeftY += float(untile_rows *
+                               int32_t(texture_cache_->draw_resolution_scale_y()));
+  }
   if (ff_viewport_update_needed_ ||
       std::memcmp(&viewport, &ff_viewport_, sizeof(D3D11_VIEWPORT)) != 0) {
     ff_viewport_ = viewport;
@@ -1183,10 +1198,17 @@ void D3D11CommandProcessor::UpdateFixedFunctionState(
   }
 
   D3D11_RECT scissor_rect;
-  scissor_rect.left = LONG(scissor.offset[0]);
-  scissor_rect.top = LONG(scissor.offset[1]);
-  scissor_rect.right = LONG(scissor.offset[0] + scissor.extent[0]);
-  scissor_rect.bottom = LONG(scissor.offset[1] + scissor.extent[1]);
+  int32_t scissor_x = int32_t(scissor.offset[0]);
+  int32_t scissor_y = int32_t(scissor.offset[1]);
+  if (untile_tiling) {
+    const auto& window_offset = register_file_->Get<reg::PA_SC_WINDOW_OFFSET>();
+    scissor_y += -int32_t(window_offset.window_y_offset) *
+                 int32_t(texture_cache_->draw_resolution_scale_y());
+  }
+  scissor_rect.left = LONG(scissor_x);
+  scissor_rect.top = LONG(scissor_y);
+  scissor_rect.right = LONG(scissor_x + int32_t(scissor.extent[0]));
+  scissor_rect.bottom = LONG(scissor_y + int32_t(scissor.extent[1]));
   if (ff_scissor_update_needed_ ||
       std::memcmp(&scissor_rect, &ff_scissor_, sizeof(D3D11_RECT)) != 0) {
     ff_scissor_ = scissor_rect;
@@ -1713,6 +1735,17 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitFrameTape("draw");
   }
   const RegisterFile& regs = *register_file_;
+  const uint32_t current_untile_band =
+      native_executor_ && native_executor_->untile_height()
+          ? Fh1D3D11UntileBand(int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))
+          : 0u;
+  if (current_untile_band &&
+      current_untile_band >= native_executor_->untile_height()) {
+    REXGPU_ERROR("D3D11 FH1 draw: band {} exceeds untile height {}", current_untile_band,
+                 native_executor_->untile_height());
+    ++draw_counters_.dropped_other;
+    return false;
+  }
   const int32_t tile_trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
   const bool trace_tile = tile_trace_swap > 0 &&
                           presented_output_frames_ == uint64_t(tile_trace_swap);
@@ -3031,7 +3064,7 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (native_executor_) {
     Fh1DrawInfo draw;
     draw.rasterization_done = true;
-    native_executor_->NativeDrawIssued(draw);
+    native_executor_->NativeDrawIssued(draw, current_untile_band);
   }
   return true;
 }
@@ -3580,6 +3613,21 @@ bool D3D11CommandProcessor::IssueCopy() {
     }
     return true;
   }
+  const uint32_t untile_band =
+      native_executor_ && native_executor_->untile_height()
+          ? Fh1D3D11UntileBand(int32_t(
+                register_file_->Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))
+          : 0u;
+  if (untile_band > 0xFFFFu ||
+      (untile_band && untile_band >= native_executor_->untile_height())) {
+    REXGPU_ERROR("D3D11 FH1 resolve: band {} exceeds the supported untile height {}",
+                 untile_band, native_executor_->untile_height());
+    return false;
+  }
+  if (native_executor_ && !untile_band && native_executor_->has_untile_bands()) {
+    if (command_lists_enabled_ && !SubmitFrameTape("untile copy-down ordering")) return false;
+    if (!native_executor_->EndUntiledTiling()) return false;
+  }
   const Fh1ResolveFlags flags{host_render_config_->depth_float24_round(),
                               host_render_config_->gamma_render_target_as_unorm16(),
                               host_render_config_->IsFixed16TruncatedToMinus1To1()};
@@ -3638,13 +3686,13 @@ bool D3D11CommandProcessor::IssueCopy() {
                                plan.color_info.color_format,
                                host_render_config_->gamma_render_target_as_unorm16()),
           plan.x0, plan.y0, plan.x1, plan.y1, plan.info.rb_color_clear,
-          plan.info.rb_color_clear_lo);
+          plan.info.rb_color_clear_lo, untile_band);
     }
     if (plan.info.IsClearingDepth()) {
       succeeded &= native_executor_->ResolveClear(
           Fh1SurfaceKey::Depth(plan.depth_info.depth_base, plan.pitch_tiles, plan.msaa,
                                plan.depth_info.depth_format),
-          plan.x0, plan.y0, plan.x1, plan.y1, plan.info.rb_depth_clear, 0);
+          plan.x0, plan.y0, plan.x1, plan.y1, plan.info.rb_depth_clear, 0, untile_band);
     }
     return succeeded;
   };
@@ -3781,12 +3829,31 @@ bool D3D11CommandProcessor::IssueCopy() {
                                                 plan.x0, plan.y0, plan.x1, plan.y1)) {
       D3D11Fh1NativeResolve::SourceRect region;
       region.rect = {rect.left, rect.top, rect.right, rect.bottom};
-      if (rect.owner != Fh1EdramTiles::kNoOwner) {
+      if (rect.owner == Fh1EdramTiles::kNoOwner) {
+        // Unclaimed tiles have no alternate owner, so the resolve key's
+        // surface remains their source.
+        region.surface = native_surfaces_->GetOrCreateSurface(plan.resolve_key);
+      } else {
         region.surface = native_surfaces_->FindSurface(rect.owner);
-        if (!source_by_owner && region.surface &&
-            rect.owner != plan.resolve_key.Pack()) {
-          source_by_owner = region.surface;
-        }
+      }
+      bool source_rows_valid = true;
+      if (region.surface &&
+          (rect.bottom < 0 ||
+           uint64_t(rect.bottom) + untile_band > region.surface->image_height)) {
+        REXGPU_ERROR("D3D11 FH1 resolve: source rows {}..{} exceed {} for owner 0x{:08X}",
+                     rect.top + int32_t(untile_band),
+                     rect.bottom + int32_t(untile_band), region.surface->image_height,
+                     rect.owner);
+        region.surface = nullptr;
+        source_rows_valid = false;
+      }
+      if (!region.surface && source_rows_valid) {
+        REXGPU_ERROR("D3D11 FH1 resolve: source surface for owner 0x{:08X} unavailable "
+                     "for rect {},{}-{},{}",
+                     rect.owner, rect.left, rect.top, rect.right, rect.bottom);
+      } else if (!source_by_owner && rect.owner != Fh1EdramTiles::kNoOwner &&
+                 rect.owner != plan.resolve_key.Pack()) {
+        source_by_owner = region.surface;
       }
       resolve_sources.push_back(region);
     }
@@ -4044,11 +4111,10 @@ bool D3D11CommandProcessor::IssueCopy() {
   const bool staging_copy_required = use_staging_copy;
   const uint32_t resolve_dest_base =
       use_staging_copy ? plan.dest_base - plan.info.copy_dest_extent_start : plan.dest_base;
-  // D3D11's normal EDRAM-sized surfaces rasterize each window-offset band at
-  // source Y=0; unlike Vulkan's optional untile-height surfaces, no extra row
-  // band is stored past the EDRAM surface. Keep the shader's upper-half row
-  // offset explicit and zero for this path.
-  const uint32_t source_row_offset = 0;
+  // The draw path stores each predicated band at its screen rows in the
+  // expanded surface; resolve from those same rows without moving the guest
+  // destination range.
+  const uint32_t source_row_offset = untile_band;
   const uint32_t resolve_sample_select =
       (plan.sample_select & 0xFFFFu) | (source_row_offset << 16);
   bool trace_resolve = false;
@@ -4257,7 +4323,7 @@ bool D3D11CommandProcessor::IssueCopy() {
     }
   }
   bool staging_copy_ok = !staging_copy_required;
-  if ((complete || any_resolved) && use_staging_copy) {
+  if (complete && use_staging_copy) {
     const bool capture_minimap_candidate = capture_minimap_frame && !plan.copying_depth &&
         plan.x1 - plan.x0 >= 256 && plan.x1 - plan.x0 <= 512 &&
         plan.y1 - plan.y0 >= 128 && plan.y1 - plan.y0 <= 256 && source.surface &&

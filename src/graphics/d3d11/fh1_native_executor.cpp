@@ -157,6 +157,7 @@ uint32_t PackRectSize(const RECT& rect) {
 constexpr uint32_t kTransferFlagGammaUnorm16 = 2;
 constexpr uint32_t kTransferFlagFixed16FullRange = 4;
 constexpr uint32_t kTransferFlagScaleShift = 12;
+constexpr uint32_t kTransferFlagSourceRowOffsetShift = 16;
 
 // Packed EDRAM surface layout for the transfer shader (identical bits to the
 // D3D12 and Vulkan executors and to the resolve's PackLayout, decoded in
@@ -521,6 +522,12 @@ bool D3D11Fh1NativeExecutor::Initialize(const D3D11Fh1NativeExecutorConfig& conf
     REXGPU_ERROR("D3D11 FH1 native executor: no native surface registry");
     return false;
   }
+  if (config.untile_height > 0xFFFFu ||
+      config.untile_height != config.surfaces->untile_height()) {
+    REXGPU_ERROR("D3D11 FH1 native executor: invalid untile height {} (surface registry {})",
+                 config.untile_height, config.surfaces->untile_height());
+    return false;
+  }
   if (config.scale != 1) {
     // The executor executes scale 1 only (the surfaces, the resolve and the
     // guest layout all agree at 1x). Refused rather than drawn into wrongly
@@ -532,6 +539,7 @@ bool D3D11Fh1NativeExecutor::Initialize(const D3D11Fh1NativeExecutorConfig& conf
   }
   config_ = config;
   tiles_.Reset();
+  untile_bands_.clear();
   initialized_ = true;
   REXGPU_INFO(
       "D3D11 FH1 native executor: initialized (scale 1, EDRAM tiles {} x {} B, shared with the "
@@ -583,6 +591,7 @@ void D3D11Fh1NativeExecutor::Shutdown() {
   transfer_direct_shaders_.clear();
   queued_rects_.clear();
   queued_chunks_.clear();
+  untile_bands_.clear();
   for (auto& entry : transfer_depth_states_) {
     if (entry.second) {
       entry.second->Release();
@@ -926,24 +935,39 @@ void D3D11Fh1NativeExecutor::FlushClaimTransfers(const SurfaceKey& dest_key,
   queued_chunks_.clear();
 }
 
-void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
+bool D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
                                            D3D11Fh1NativeSurface& dest,
                                            uint32_t previous_owner, const RECT* rects,
                                            uint32_t rect_count, uint32_t tile_count,
-                                           bool stencil) {
+                                           bool stencil, uint32_t source_row_offset) {
   if (!rect_count || !config_.surfaces || !dest.texture) {
-    return;
+    return false;
   }
   D3D11Fh1NativeSurface* source = config_.surfaces->FindSurface(previous_owner);
   if (!source || !source->texture) {
     // The previous owner never got a surface in this session (or it was
     // released): nothing to inherit, the claimant's own cleared content stays.
     ++transfer_skipped_source_;
-    return;
+    return false;
+  }
+  for (uint32_t i = 0; i < rect_count; ++i) {
+    if (source_row_offset > 0xFFFFu || rects[i].left < 0 || rects[i].top < 0 ||
+        rects[i].right <= rects[i].left ||
+        rects[i].bottom <= rects[i].top || uint32_t(rects[i].right) > dest.width ||
+        uint32_t(rects[i].bottom) > dest.image_height ||
+        source_row_offset > source->image_height ||
+        uint32_t(rects[i].bottom) > source->image_height - source_row_offset) {
+      REXGPU_ERROR("D3D11 FH1 native executor: invalid transfer rectangle for {} "
+                   "rect={},{}-{},{} source_row_offset={} source_height={} dest_height={}",
+                   dest_key.Describe(), rects[i].left, rects[i].top, rects[i].right,
+                   rects[i].bottom, source_row_offset, source->image_height, dest.image_height);
+      return false;
+    }
   }
   ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
   if (!context) {
-    return;
+    REXGPU_ERROR("D3D11 FH1 native executor: no immediate context for transfer");
+    return false;
   }
   D3D11_TEXTURE2D_DESC dest_desc = {}, source_desc = {};
   dest.texture->GetDesc(&dest_desc);
@@ -955,13 +979,14 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
       Fh1D3D11SurfaceTilePitch(dest_key) == Fh1D3D11SurfaceTilePitch(source->key) &&
       dest_key.Is64bpp() == source->key.Is64bpp() && dest_key.msaa == source->key.msaa &&
       dest_key.is_depth == source->key.is_depth;
-  if (same_geometry && dest_desc.Format == source_desc.Format &&
+  if (!source_row_offset && same_geometry && dest_desc.Format == source_desc.Format &&
       dest_desc.SampleDesc.Count == source_desc.SampleDesc.Count) {
     // A depth copy is the clearest probe of all: the same rectangle of the same
     // format in both surfaces, so the claimant's depth must end up holding its
     // predecessor's texel for texel.
     int64_t probe_before = -1;
-    const bool probe = REXCVAR_GET(fh1_swap_fetch_trace) && dest_key.is_depth &&
+    const bool probe = !source_row_offset && REXCVAR_GET(fh1_swap_fetch_trace) &&
+                       dest_key.is_depth &&
                        transfer_depth_verified_ < 8 && transfer_depth_probe_attempts_ < 60 &&
                        dest_desc.SampleDesc.Count == 1;
     if (probe) {
@@ -980,7 +1005,7 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
     if (probe_before >= 0) {
       VerifyDepthTransfer(dest, *source, rects[0], uint64_t(probe_before));
     }
-    return;
+    return true;
   }
 
   // Everything else goes through the transfer shader, which reads the previous
@@ -990,15 +1015,15 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   // - the Direct3D 12 executor's transfer_words and from_words - where a source
   // of any kind is supported.
   if (dest_key.is_depth) {
-    TransferDepthRects(dest_key, dest, *source, rects, rect_count, tile_count, stencil);
-    return;
+    return TransferDepthRects(dest_key, dest, *source, rects, rect_count, tile_count, stencil,
+                              source_row_offset);
   }
   if (!Fh1IsResolveColorFormatSupported(xenos::ColorRenderTargetFormat(dest_key.format)) ||
       (!source->key.is_depth &&
        !Fh1IsResolveColorFormatSupported(
            xenos::ColorRenderTargetFormat(source->key.format)))) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   const uint32_t source_kind = TransferSourceKind(*source);
   // A destination whose texture has a UINT view must be written through it: its
@@ -1007,23 +1032,24 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   ID3D11RenderTargetView* render_target = dest_kind == kTransferDestUint ? dest.uint_rtv : dest.rtv;
   if (!EnsureTransferResources()) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   ID3D11PixelShader* pixel_shader =
       GetTransferShader(source_kind, source->samples > 1, dest_kind, dest.samples > 1);
   if (!render_target || !pixel_shader || !source->srv) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   if (source_kind == kTransferSourceDepth && !source->stencil_srv) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
 
   const uint32_t host_sample_mode_shift = 27;
   const uint32_t flags = (config_.gamma_as_unorm16 ? kTransferFlagGammaUnorm16 : 0u) |
                          (config_.fixed16_full_range ? kTransferFlagFixed16FullRange : 0u) |
-                         ((config_.scale - 1) << kTransferFlagScaleShift);
+                         ((config_.scale - 1) << kTransferFlagScaleShift) |
+                         (source_row_offset << kTransferFlagSourceRowOffsetShift);
   const uint32_t constants[4] = {
       PackLayout(dest_key.base_tiles, dest_key.pitch_tiles, dest_key.msaa, dest_key.Is64bpp(),
                  dest_key.is_depth, dest_key.format) |
@@ -1035,7 +1061,7 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   D3D11_MAPPED_SUBRESOURCE mapped;
   if (FAILED(context->Map(transfer_constants_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   std::memcpy(mapped.pData, constants, sizeof(constants));
   context->Unmap(transfer_constants_, 0);
@@ -1059,7 +1085,8 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   // for the same rectangle (same geometry and single sample only, so the pixel
   // rectangle means the same thing in both surfaces).
   int64_t probe_before = -1;
-  const bool probe = REXCVAR_GET(fh1_swap_fetch_trace) && transfer_verified_ < 8 &&
+  const bool probe = !source_row_offset && REXCVAR_GET(fh1_swap_fetch_trace) &&
+                     transfer_verified_ < 8 &&
                      dest_key.pitch_tiles == source->key.pitch_tiles &&
                      dest_key.Is64bpp() == source->key.Is64bpp() &&
                      dest_key.msaa == source->key.msaa && dest.samples == 1 &&
@@ -1085,6 +1112,7 @@ void D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
   if (probe_before >= 0) {
     VerifyTransfer(dest, *source, rects[0], uint64_t(probe_before));
   }
+  return true;
 }
 
 int64_t D3D11Fh1NativeExecutor::CountZeroTexels(ID3D11Texture2D* texture, const RECT& rect) {
@@ -1186,25 +1214,25 @@ bool D3D11Fh1NativeExecutor::TransferDirectSupported(
          format != uint32_t(xenos::ColorRenderTargetFormat::k_16_16_16_16);
 }
 
-void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
+bool D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
                                                 D3D11Fh1NativeSurface& dest,
                                                 D3D11Fh1NativeSurface& source, const RECT* rects,
                                                 uint32_t rect_count, uint32_t tile_count,
-                                                bool stencil) {
+                                                bool stencil, uint32_t source_row_offset) {
   if (!rect_count || !dest.texture || !dest.dsv) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   ID3D11Device* device = command_processor_.GetD3D11Provider().GetDevice();
   ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
   if (!device || !context || !EnsureTransferResources()) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   const uint32_t source_kind = TransferSourceKind(source);
   if (!source.srv || (source_kind == kTransferSourceDepth && !source.stencil_srv)) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   const bool dest_msaa = dest.samples > 1;
   // Direct: the depth and stencil passes read the previous owner's surface
@@ -1213,7 +1241,16 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
   // 12 and Vulkan backends already run; the words pass stays for a source whose
   // words the direct shader would compute differently (TransferDirectSupported),
   // and is what runs unless fh1_debug_transfer_direct asks for the other.
-  const bool direct = TransferDirectSupported(source) && REXCVAR_GET(fh1_debug_transfer_direct);
+  const bool direct_supported = TransferDirectSupported(source);
+  if (source_row_offset && !direct_supported) {
+    REXGPU_ERROR("D3D11 FH1 native executor: cannot copy down depth surface {} with its "
+                 "word-transfer path",
+                 dest_key.Describe());
+    ++transfer_skipped_format_;
+    return false;
+  }
+  const bool direct =
+      direct_supported && (source_row_offset || REXCVAR_GET(fh1_debug_transfer_direct));
   ID3D11ComputeShader* words_shader =
       direct ? nullptr : GetTransferWordsBatchShader(source_kind, source.samples > 1);
   ID3D11PixelShader* depth_shader =
@@ -1226,18 +1263,19 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
                                                    kTransferDestStencil, dest_msaa)
                          : GetTransferFromWordsShader(kTransferDestStencil, dest_msaa));
   const uint32_t dest_width = dest.width * config_.scale;
-  const uint32_t dest_height = dest.height * config_.scale;
+  const uint32_t dest_height = dest.image_height * config_.scale;
   if (!depth_shader || (stencil && !stencil_shader) ||
       (!direct &&
        (!words_shader ||
         !EnsureTransferWords(uint64_t(dest_width) * dest_height * dest.samples)))) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
 
   const uint32_t flags = (config_.gamma_as_unorm16 ? kTransferFlagGammaUnorm16 : 0u) |
                          (config_.fixed16_full_range ? kTransferFlagFixed16FullRange : 0u) |
-                         ((config_.scale - 1) << kTransferFlagScaleShift);
+                         ((config_.scale - 1) << kTransferFlagScaleShift) |
+                         (source_row_offset << kTransferFlagSourceRowOffsetShift);
   constexpr uint32_t kHostSampleModeShift = 27;
   const uint32_t dest_layout =
       PackLayout(dest_key.base_tiles, dest_key.pitch_tiles, dest_key.msaa, dest_key.Is64bpp(),
@@ -1358,7 +1396,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
     }
     if (words_failed) {
       ++transfer_skipped_format_;
-      return;
+      return false;
     }
     transfer_word_rects_ += rect_count;
     transfer_words_ += rect_area * dest.samples;
@@ -1386,7 +1424,8 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
                            dest_key.msaa == source.key.msaa &&
                            dest.samples == source.samples;
   int64_t probe_before = -1;
-  if (REXCVAR_GET(fh1_swap_fetch_trace) && transfer_depth_verified_ < 8 &&
+  if (!source_row_offset && REXCVAR_GET(fh1_swap_fetch_trace) &&
+      transfer_depth_verified_ < 8 &&
       transfer_depth_probe_attempts_ < 60 &&
       (source.key.is_depth || (same_layout && transfer_depth_probe_attempts_ < 12))) {
     ++transfer_depth_probe_attempts_;
@@ -1422,7 +1461,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
   const uint32_t pass_constants[3] = {dest_layout, direct ? source_layout : dest_shape, flags};
   if (!set_constants(pass_constants, 3)) {
     ++transfer_skipped_format_;
-    return;
+    return false;
   }
   for (uint32_t i = 0; i < rect_count; ++i) {
     D3D11_VIEWPORT viewport = {};
@@ -1441,6 +1480,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
   // Third step: one pass per stencil bit the previous owner may hold. The
   // shader discards where the bit is clear, the pipeline replaces it where it
   // is not - the Direct3D 12 executor's eight stencil passes.
+  bool stencil_passes_succeeded = true;
   if (stencil) {
     if (stencil_shader) {
       context->PSSetShader(stencil_shader, nullptr, 0);
@@ -1448,6 +1488,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
         const uint32_t stencil_constants[3] = {
             dest_layout, direct ? source_layout : dest_shape, flags | (bit << 8)};
         if (!set_constants(stencil_constants, 3)) {
+          stencil_passes_succeeded = false;
           break;
         }
         context->OMSetDepthStencilState(GetTransferStencilState(bit), 1u << bit);
@@ -1467,6 +1508,7 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
       }
     } else {
       ++transfer_skipped_format_;
+      stencil_passes_succeeded = false;
     }
   }
   if (direct) {
@@ -1479,9 +1521,11 @@ void D3D11Fh1NativeExecutor::TransferDepthRects(const SurfaceKey& dest_key,
   }
   ++transfers_;
   transfer_tiles_ += tile_count;
+  if (!stencil_passes_succeeded) return false;
   if (probe_before >= 0) {
     VerifyDepthTransfer(dest, source, rects[0], uint64_t(probe_before));
   }
+  return true;
 }
 
 bool D3D11Fh1NativeExecutor::EnsureTransferWords(uint64_t word_count) {
@@ -2320,9 +2364,14 @@ std::map<uint32_t, uint32_t> D3D11Fh1NativeExecutor::EnumerateResolveOwners(
 
 bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0,
                                           int32_t x1, int32_t y1, uint32_t clear_value,
-                                          uint32_t clear_value_lo, bool clear_depth,
-                                          bool clear_stencil) {
+                                          uint32_t clear_value_lo, uint32_t untile_band,
+                                          bool clear_depth, bool clear_stencil) {
   if (!initialized_ || !key.pitch_tiles || x0 >= x1 || y0 >= y1) {
+    return false;
+  }
+  if (untile_band >= config_.untile_height && untile_band) {
+    REXGPU_ERROR("D3D11 FH1 native executor: resolve-clear band {} exceeds untile height {}",
+                 untile_band, config_.untile_height);
     return false;
   }
   D3D11Fh1NativeSurface* surface = config_.surfaces->GetOrCreateSurface(key);
@@ -2346,7 +2395,14 @@ bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, 
   const int32_t bottom = std::min(y1, int32_t(geometry.surface_height));
   if (left >= right || top >= bottom) return true;
   if (key.is_depth && !clear_depth && !clear_stencil) return true;
-  const RECT rect = {LONG(left), LONG(top), LONG(right), LONG(bottom)};
+  const int64_t physical_top_wide = int64_t(top) + untile_band;
+  const int64_t physical_bottom_wide = int64_t(bottom) + untile_band;
+  if (physical_top_wide >= surface->image_height) return true;
+  const int32_t physical_top = int32_t(physical_top_wide);
+  const int32_t physical_bottom =
+      int32_t(std::min<int64_t>(physical_bottom_wide, surface->image_height));
+  if (physical_top >= physical_bottom) return true;
+  const RECT rect = {LONG(left), LONG(physical_top), LONG(right), LONG(physical_bottom)};
 
   float color[4] = {};
   uint32_t raw_color[4] = {};
@@ -2479,7 +2535,7 @@ bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, 
   context->RSSetState(clear_rasterizer_state_);
   D3D11_VIEWPORT viewport = {};
   viewport.Width = float(surface->width);
-  viewport.Height = float(surface->height);
+  viewport.Height = float(surface->image_height);
   viewport.MaxDepth = 1.0f;
   context->RSSetViewports(1, &viewport);
   context->RSSetScissorRects(1, &rect);
@@ -2496,15 +2552,19 @@ bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, 
   context->Draw(3, 0);
   if (key.is_depth && clear_stencil) {
     const bool full_surface =
-        left == 0 && top == 0 && right == int32_t(surface->width) &&
-        bottom == int32_t(surface->height);
+        left == 0 && physical_top == 0 && right == int32_t(surface->width) &&
+        physical_bottom == int32_t(surface->image_height);
     surface->stencil_nonzero =
         (clear_value & 0xFF) != 0 || (surface->stencil_nonzero && !full_surface);
+  }
+  if (untile_band) {
+    uint32_t& band = untile_bands_[key.Pack()];
+    band = std::max(band, untile_band);
   }
   return true;
 }
 
-void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
+void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw, uint32_t untile_band) {
   if (!initialized_) {
     return;
   }
@@ -2512,6 +2572,104 @@ void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw) {
     return;
   }
   ++draws_;
+  if (untile_band) {
+    if (untile_band >= config_.untile_height) {
+      REXGPU_ERROR("D3D11 FH1 native executor: draw band {} exceeds untile height {}",
+                   untile_band, config_.untile_height);
+      return;
+    }
+    for (uint32_t i = 0; i < std::size(pending_surfaces_); ++i) {
+      if (!(pending_used_bits_ & (1u << i)) || !pending_surfaces_[i]) continue;
+      uint32_t& band = untile_bands_[pending_surfaces_[i]->key.Pack()];
+      band = std::max(band, untile_band);
+    }
+  }
+}
+
+bool D3D11Fh1NativeExecutor::EndUntiledTiling() {
+  if (!initialized_ || untile_bands_.empty()) return true;
+
+  ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
+  if (!context) {
+    REXGPU_ERROR("D3D11 FH1 native executor: no immediate context for untile copy-down");
+    return false;
+  }
+  ScopedD3D11ClearState saved_state(context);
+  std::vector<uint32_t> completed;
+  bool succeeded = true;
+  std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>
+      no_srvs = {};
+  auto unbind_srvs = [&]() {
+    context->VSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+    context->HSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+    context->DSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+    context->GSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+    context->PSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+    context->CSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
+  };
+  for (const auto& [packed, band] : untile_bands_) {
+    D3D11Fh1NativeSurface* surface = config_.surfaces->FindSurface(packed);
+    if (!surface || !surface->texture) {
+      REXGPU_ERROR("D3D11 FH1 native executor: copy-down surface 0x{:08X} is unavailable",
+                   packed);
+      succeeded = false;
+      continue;
+    }
+    const uint32_t copy_rows = Fh1D3D11CopyDownRows(config_.untile_height, band);
+    if (!copy_rows) {
+      completed.push_back(packed);
+      continue;
+    }
+    if (band > surface->image_height || copy_rows > surface->image_height - band) {
+      REXGPU_ERROR("D3D11 FH1 native executor: copy-down rows {}..{} exceed {} (key={})",
+                   band, band + copy_rows, surface->image_height, surface->key.Describe());
+      succeeded = false;
+      continue;
+    }
+    if (!config_.surfaces->EnsureCopyDownSurface(*surface)) {
+      succeeded = false;
+      continue;
+    }
+
+    ID3D11RenderTargetView* no_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
+    unbind_srvs();
+    context->CopyResource(surface->copy_down_texture, surface->texture);
+    context->OMSetBlendState(nullptr, nullptr,
+                             Fh1D3D11SampleMask(surface->key, surface->samples));
+
+    D3D11Fh1NativeSurface copy_down = *surface;
+    copy_down.texture = surface->copy_down_texture;
+    copy_down.rtv = surface->copy_down_rtv;
+    copy_down.uint_rtv = surface->copy_down_uint_rtv;
+    copy_down.dsv = surface->copy_down_dsv;
+    const RECT rect = {0, 0, LONG(surface->width), LONG(copy_rows)};
+    TileGeometry geometry;
+    if (!GetTileGeometry(*surface, geometry)) {
+      REXGPU_ERROR("D3D11 FH1 native executor: copy-down geometry unavailable for {}",
+                   surface->key.Describe());
+      succeeded = false;
+      continue;
+    }
+    const uint32_t tile_rows = (copy_rows + geometry.pixel_height - 1) / geometry.pixel_height;
+    const uint32_t tile_count = geometry.columns * tile_rows;
+    if (!TransferRects(surface->key, copy_down, packed, &rect, 1, tile_count,
+                       surface->stencil_nonzero, band)) {
+      succeeded = false;
+      continue;
+    }
+
+    unbind_srvs();
+    ID3D11UnorderedAccessView* no_uav = nullptr;
+    context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
+    context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
+    context->CopyResource(surface->texture, surface->copy_down_texture);
+    completed.push_back(packed);
+    REXGPU_INFO("D3D11 FH1 untile copy-down: key={} band={} rows=0..{} samples={}",
+                surface->key.Describe(), band, copy_rows, surface->samples);
+  }
+  for (uint32_t packed : completed) untile_bands_.erase(packed);
+  return succeeded;
 }
 
 void D3D11Fh1NativeExecutor::OnSwap(uint64_t frame, uint32_t frontbuffer_address) {

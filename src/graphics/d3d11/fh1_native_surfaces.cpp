@@ -16,6 +16,8 @@
 
 #include <rex/graphics/d3d11/fh1_native_surfaces.h>
 
+#include <wrl/client.h>
+
 #include <rex/logging.h>
 
 namespace rex::graphics::d3d11 {
@@ -41,8 +43,9 @@ bool CreateView(ID3D11Device* device, ID3D11Texture2D* texture, DXGI_FORMAT form
 }  // namespace
 
 D3D11Fh1NativeSurfaces::D3D11Fh1NativeSurfaces(ID3D11Device* device,
-                                               const D3D11HostRenderConfig& config)
-    : device_(device), config_(config) {}
+                                               const D3D11HostRenderConfig& config,
+                                               uint32_t untile_height)
+    : device_(device), config_(config), untile_height_(untile_height) {}
 
 D3D11Fh1NativeSurfaces::~D3D11Fh1NativeSurfaces() {
   Shutdown();
@@ -51,6 +54,10 @@ D3D11Fh1NativeSurfaces::~D3D11Fh1NativeSurfaces() {
 void D3D11Fh1NativeSurfaces::Shutdown() {
   for (auto& entry : surfaces_) {
     D3D11Fh1NativeSurface& surface = *entry.second;
+    if (surface.copy_down_dsv) surface.copy_down_dsv->Release();
+    if (surface.copy_down_uint_rtv) surface.copy_down_uint_rtv->Release();
+    if (surface.copy_down_rtv) surface.copy_down_rtv->Release();
+    if (surface.copy_down_texture) surface.copy_down_texture->Release();
     if (surface.stencil_srv) surface.stencil_srv->Release();
     if (surface.srv) surface.srv->Release();
     if (surface.dsv) surface.dsv->Release();
@@ -66,6 +73,54 @@ D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::FindSurface(uint32_t packed_key) 
   return it != surfaces_.end() ? it->second.get() : nullptr;
 }
 
+bool D3D11Fh1NativeSurfaces::EnsureCopyDownSurface(D3D11Fh1NativeSurface& surface) {
+  if (surface.copy_down_texture) return true;
+  if (!device_ || !surface.texture) return false;
+
+  D3D11_TEXTURE2D_DESC texture_desc = {};
+  surface.texture->GetDesc(&texture_desc);
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+  HRESULT hr = device_->CreateTexture2D(&texture_desc, nullptr, texture.GetAddressOf());
+  if (FAILED(hr)) {
+    REXGPU_ERROR("D3D11 FH1 native surfaces: copy-down texture creation failed for {} hr={:08X}",
+                 surface.key.Describe(), static_cast<uint32_t>(hr));
+    return false;
+  }
+
+  const bool msaa = surface.samples > 1;
+  Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
+  Microsoft::WRL::ComPtr<ID3D11RenderTargetView> uint_rtv;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilView> dsv;
+  if (surface.key.is_depth) {
+    D3D11_DEPTH_STENCIL_VIEW_DESC view_desc = {};
+    view_desc.Format = surface.view_format;
+    view_desc.ViewDimension = msaa ? D3D11_DSV_DIMENSION_TEXTURE2DMS
+                                   : D3D11_DSV_DIMENSION_TEXTURE2D;
+    hr = device_->CreateDepthStencilView(texture.Get(), &view_desc, dsv.GetAddressOf());
+  } else {
+    D3D11_RENDER_TARGET_VIEW_DESC view_desc = {};
+    view_desc.Format = surface.view_format;
+    view_desc.ViewDimension = msaa ? D3D11_RTV_DIMENSION_TEXTURE2DMS
+                                   : D3D11_RTV_DIMENSION_TEXTURE2D;
+    hr = device_->CreateRenderTargetView(texture.Get(), &view_desc, rtv.GetAddressOf());
+    if (SUCCEEDED(hr) && surface.uint_rtv) {
+      view_desc.Format = surface.srv_format;
+      hr = device_->CreateRenderTargetView(texture.Get(), &view_desc, uint_rtv.GetAddressOf());
+    }
+  }
+  if (FAILED(hr)) {
+    REXGPU_ERROR("D3D11 FH1 native surfaces: copy-down view creation failed for {} hr={:08X}",
+                 surface.key.Describe(), static_cast<uint32_t>(hr));
+    return false;
+  }
+
+  surface.copy_down_texture = texture.Detach();
+  surface.copy_down_rtv = rtv.Detach();
+  surface.copy_down_uint_rtv = uint_rtv.Detach();
+  surface.copy_down_dsv = dsv.Detach();
+  return true;
+}
+
 D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::GetOrCreateSurface(const Fh1SurfaceKey& key) {
   const uint32_t packed = key.Pack();
   if (D3D11Fh1NativeSurface* existing = FindSurface(packed)) return existing;
@@ -74,11 +129,13 @@ D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::GetOrCreateSurface(const Fh1Surfa
   surface->key = key;
   surface->width = Fh1D3D11SurfaceWidth(key);
   surface->height = Fh1D3D11SurfaceHeight(key, config_.draw_resolution_scale_x());
+  surface->image_height =
+      Fh1D3D11SurfaceImageHeight(key, config_.draw_resolution_scale_x(), untile_height_);
   surface->samples = Fh1D3D11SurfaceSamples(key.msaa, config_.msaa_2x_supported());
 
   D3D11_TEXTURE2D_DESC desc = {};
   desc.Width = surface->width * config_.draw_resolution_scale_x();
-  desc.Height = surface->height * config_.draw_resolution_scale_x();
+  desc.Height = surface->image_height * config_.draw_resolution_scale_x();
   desc.MipLevels = 1;
   desc.ArraySize = 1;
   desc.SampleDesc.Count = surface->samples;
@@ -100,7 +157,8 @@ D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::GetOrCreateSurface(const Fh1Surfa
         uint_format != DXGI_FORMAT_UNKNOWN ? uint_format : surface->view_format;
     surface->stencil_srv_format = DXGI_FORMAT_UNKNOWN;
   }
-  if (desc.Format == DXGI_FORMAT_UNKNOWN || !surface->width || !surface->height) {
+  if (desc.Format == DXGI_FORMAT_UNKNOWN || !surface->width || !surface->height ||
+      !surface->image_height) {
     REXGPU_WARN("D3D11 FH1 native surfaces: cannot represent {} natively",
                 key.Describe());
     return nullptr;
