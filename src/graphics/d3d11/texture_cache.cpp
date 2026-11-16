@@ -39,6 +39,11 @@
 #include <rex/perf/counter.h>
 #include <rex/ui/d3d11/d3d11_api.h>
 
+REXCVAR_DEFINE_BOOL(
+    d3d11_skip_texture_refresh, true, "GPU",
+    "Skip redundant D3D11 texture-refresh waits when no new resolve has landed; disable to force "
+    "a wait before each refresh for diagnostics.");
+
 namespace rex::graphics::d3d11 {
 
 namespace {

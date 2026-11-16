@@ -34,6 +34,11 @@ REXCVAR_DEFINE_STRING(d3d11_adapter, "",
                       "\"GTX 570\"); empty selects the first feature level 11_0 hardware "
                       "adapter.");
 
+#if defined(_DEBUG) || defined(REX_GPU_DEBUG)
+REXCVAR_DEFINE_BOOL(d3d11_debug, false, "UI/D3D11", "Enable the Direct3D 11 debug layer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
+
 namespace rex::ui::d3d11 {
 
 namespace {
@@ -54,6 +59,16 @@ bool DescriptionMatches(const wchar_t* description) {
   std::transform(needle.begin(), needle.end(), needle_lower.begin(),
                  [](char c) { return wchar_t(std::towlower(wchar_t((unsigned char)c))); });
   return haystack.find(needle_lower) != std::wstring::npos;
+}
+
+UINT GetDeviceCreationFlags() {
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+#if defined(_DEBUG) || defined(REX_GPU_DEBUG)
+  if (REXCVAR_GET(d3d11_debug)) {
+    flags |= D3D11_CREATE_DEVICE_DEBUG;
+  }
+#endif
+  return flags;
 }
 
 }  // namespace
@@ -226,10 +241,11 @@ ID3D11Device* D3D11Provider::GetOrCreatePresentDevice(HWND hwnd) const {
 
   const D3D_FEATURE_LEVEL requested_feature_level = D3D_FEATURE_LEVEL_11_0;
   D3D_FEATURE_LEVEL created_feature_level = D3D_FEATURE_LEVEL_11_0;
+  const UINT create_flags = GetDeviceCreationFlags();
   Microsoft::WRL::ComPtr<ID3D11Device> present_device;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> present_context;
   HRESULT create_result = D3D11CreateDevice(
-      chosen.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+      chosen.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, create_flags,
       &requested_feature_level, 1, D3D11_SDK_VERSION, &present_device,
       &created_feature_level, &present_context);
   if (FAILED(create_result) || created_feature_level != D3D_FEATURE_LEVEL_11_0) {
@@ -326,7 +342,7 @@ bool D3D11Provider::Initialize() {
   // the device cannot silently come up at a lower level.
   const D3D_FEATURE_LEVEL requested_feature_level = D3D_FEATURE_LEVEL_11_0;
   D3D_FEATURE_LEVEL created_feature_level = D3D_FEATURE_LEVEL_11_0;
-  UINT create_flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  const UINT create_flags = GetDeviceCreationFlags();
   Microsoft::WRL::ComPtr<ID3D11Device> device;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> immediate_context;
   HRESULT create_result = D3D11CreateDevice(

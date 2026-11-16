@@ -10,6 +10,7 @@
  */
 
 #include <rex/graphics/d3d11/command_list.h>
+#include <rex/logging/macros.h>
 
 #include <algorithm>
 #include <cstring>
@@ -29,18 +30,25 @@ D3D11CommandList::D3D11CommandList(size_t max_packets, size_t max_arena_bytes)
 
 D3D11CommandList::~D3D11CommandList() = default;
 
-bool D3D11CommandList::AppendBytes(const void* data, size_t size, D3D11ArenaSpan& span_out) {
+bool D3D11CommandList::AppendBytes(const void* data, size_t size, D3D11ArenaSpan& span_out,
+                                   const char* packet_type) {
   span_out = {};
   if (size == 0) {
     return true;
   }
   if (data == nullptr) {
-    overflow_ = true;
+    if (MarkOverflow()) {
+      REXGPU_WARN("D3D11 command list arena overflow: arena size={} max={} packet={}",
+                  arena_.size(), max_arena_bytes_, packet_type ? packet_type : "unknown");
+    }
     return false;
   }
   const size_t offset = AlignUp(arena_.size(), kArenaAlignment);
   if (size > max_arena_bytes_ || offset > max_arena_bytes_ - size) {
-    overflow_ = true;
+    if (MarkOverflow()) {
+      REXGPU_WARN("D3D11 command list arena overflow: arena size={} max={} packet={}",
+                  arena_.size(), max_arena_bytes_, packet_type ? packet_type : "unknown");
+    }
     return false;
   }
   arena_.resize(offset + size);
@@ -61,7 +69,7 @@ bool D3D11CommandList::AppendUploadBufferPacket(ID3D11Buffer* destination,
     return false;
   }
   D3D11ArenaSpan span;
-  if (!AppendBytes(data, size, span)) {
+  if (!AppendBytes(data, size, span, "D3D11UploadBufferPacket")) {
     commands_.pop_back();
     return false;
   }

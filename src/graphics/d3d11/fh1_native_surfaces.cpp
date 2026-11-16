@@ -1,3 +1,4 @@
+#include <rex/graphics/render_forensics.h>
 /**
  * @file        graphics/d3d11/fh1_native_surfaces.cpp
  * @brief       D3D11 backend: native EDRAM surfaces (Phase 4)
@@ -122,6 +123,14 @@ bool D3D11Fh1NativeSurfaces::EnsureCopyDownSurface(D3D11Fh1NativeSurface& surfac
 }
 
 D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::GetOrCreateSurface(const Fh1SurfaceKey& key) {
+  // H-RSC-1: every EDRAM surface gets a stable resource id, so a frame can be
+  // explained by id rather than by address alone.
+  uint32_t forensics_resource_id = 0;
+  if (rex::graphics::render_forensics::Active()) {
+    forensics_resource_id =
+        rex::graphics::render_forensics::NoteResourceCreate(uint32_t(key.base_tiles), key.pitch_tiles, "surface");
+    (void)forensics_resource_id;
+  }
   const uint32_t packed = key.Pack();
   if (D3D11Fh1NativeSurface* existing = FindSurface(packed)) return existing;
 
@@ -135,7 +144,7 @@ D3D11Fh1NativeSurface* D3D11Fh1NativeSurfaces::GetOrCreateSurface(const Fh1Surfa
 
   D3D11_TEXTURE2D_DESC desc = {};
   desc.Width = surface->width * config_.draw_resolution_scale_x();
-  desc.Height = surface->image_height * config_.draw_resolution_scale_x();
+  desc.Height = surface->image_height * config_.draw_resolution_scale_y();
   desc.MipLevels = 1;
   desc.ArraySize = 1;
   desc.SampleDesc.Count = surface->samples;

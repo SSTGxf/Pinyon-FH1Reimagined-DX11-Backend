@@ -45,6 +45,7 @@ REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_from_swap);
 REXCVAR_DECLARE(bool, fh1_debug_disable_msaa);
 REXCVAR_DECLARE(int32_t, fh1_debug_tile_trace_swap);
 REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
+REXCVAR_DECLARE(bool, d3d11_skip_texture_refresh);
 #include <rex/graphics/d3d11/fh1_native_surfaces.h>
 #include <rex/graphics/d3d11/graphics_system.h>
 #include <rex/graphics/d3d11/host_render_config.h>
@@ -64,6 +65,10 @@ REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
 #include <rex/ui/d3d11/d3d11_provider.h>
 #include <rex/ui/presenter.h>
 #include <rex/graphics/render_audit.h>
+#include <rex/graphics/render_forensics.h>
+
+REXCVAR_DEFINE_BOOL(d3d11_band_trace, false, "GPU",
+                    "Log D3D11 FH1 untile resolve and viewport/scissor band diagnostics");
 
 namespace rex::graphics::d3d11 {
 
@@ -1209,6 +1214,14 @@ void D3D11CommandProcessor::UpdateFixedFunctionState(
   scissor_rect.top = LONG(scissor_y);
   scissor_rect.right = LONG(scissor_x + int32_t(scissor.extent[0]));
   scissor_rect.bottom = LONG(scissor_y + int32_t(scissor.extent[1]));
+  if (untile_tiling && REXCVAR_GET(d3d11_band_trace)) {
+    const uint32_t current_untile_band = Fh1D3D11UntileBand(int32_t(
+        register_file_->Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset));
+    REXGPU_INFO("D3D11 band trace viewport: frame={} band={} viewport_y={} viewport_height={} "
+                "scissor_top={} scissor_bottom={}",
+                presented_output_frames_, current_untile_band, viewport.TopLeftY, viewport.Height,
+                scissor_rect.top, scissor_rect.bottom);
+  }
   if (ff_scissor_update_needed_ ||
       std::memcmp(&scissor_rect, &ff_scissor_, sizeof(D3D11_RECT)) != 0) {
     ff_scissor_ = scissor_rect;
@@ -3290,7 +3303,7 @@ bool D3D11CommandProcessor::RecordTextureUpload(ID3D11Resource* destination,
       return false;
     }
     D3D11ArenaSpan span;
-    if (!tape.AppendBytes(data, size, span)) {
+    if (!tape.AppendBytes(data, size, span, "D3D11UploadTexturePacket")) {
       tape.Truncate(mark);
       return false;
     }
@@ -3420,7 +3433,7 @@ bool D3D11CommandProcessor::RecordDrawPacket(const D3D11PipelineCache::D3D11Pipe
           std::max<size_t>(binding->size ? size_t(binding->size) : 0, binding->cpu_bytes.size());
       padded.assign(upload_size, 0);
       std::memcpy(padded.data(), binding->cpu_bytes.data(), binding->cpu_bytes.size());
-      if (!tape.AppendBytes(padded.data(), upload_size, spans[i])) {
+      if (!tape.AppendBytes(padded.data(), upload_size, spans[i], "D3D11DrawPacket")) {
         tape.Truncate(mark);
         return false;
       }
@@ -3632,7 +3645,29 @@ bool D3D11CommandProcessor::IssueCopy() {
                               host_render_config_->gamma_render_target_as_unorm16(),
                               host_render_config_->IsFixed16TruncatedToMinus1To1()};
   Fh1ResolvePlan plan;
-  if (!Fh1PlanResolve(*register_file_, *memory_, flags, plan)) {
+  const bool resolve_plan_succeeded = Fh1PlanResolve(*register_file_, *memory_, flags, plan);
+
+  // Forensics (H-RES-1/H-RES-2): every planning failure carries a stable RF id,
+  // and every native resolve records its rectangle and destination.
+  if (rex::graphics::render_forensics::Active()) {
+    rex::graphics::render_forensics::NoteResolvePlan(
+        plan.resolve_key.base_tiles, static_cast<uint8_t>(plan.failure), plan.skip, plan.x0,
+        plan.y0, plan.x1, plan.y1);
+    if (resolve_plan_succeeded && plan.copy) {
+      rex::graphics::render_forensics::NoteResolveEntry(
+          plan.resolve_key.base_tiles, plan.x0, plan.y0, plan.x1, plan.y1, plan.msaa,
+          plan.sample_select, plan.dest_base, plan.dest_pitch);
+    }
+  }
+  if (REXCVAR_GET(d3d11_band_trace)) {
+    REXGPU_INFO(
+        "D3D11 band trace resolve: frame={} band={} rect={},{}-{},{} key={} "
+        "clear_color={} clear_depth={}",
+        presented_output_frames_, untile_band, plan.x0, plan.y0, plan.x1, plan.y1,
+        plan.resolve_key.Describe(), plan.info.IsClearingColor() ? 1 : 0,
+        plan.info.IsClearingDepth() ? 1 : 0);
+  }
+  if (!resolve_plan_succeeded) {
     if (trace_band2) {
       const RegisterFile& regs = *register_file_;
       const auto fetch = regs.GetVertexFetch(0);
@@ -5286,7 +5321,8 @@ bool D3D11CommandProcessor::RefreshResolvedGuestRange(uint32_t start, uint32_t l
   // means no new mirror data exists. Skips the tape replay too - it only
   // matters when a resolve landed, and the tape was flushed by that wait.
   const bool refresh_wait_ready =
-      refresh_waited_ && refresh_waited_resolve_count_ == resolve_call_count_;
+      REXCVAR_GET(d3d11_skip_texture_refresh) && refresh_waited_ &&
+      refresh_waited_resolve_count_ == resolve_call_count_;
   if (refresh_wait_ready) {
     ++refresh_waits_skipped_;
   } else {
@@ -5375,13 +5411,17 @@ void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // The frame counter must advance for any capture that needs it, not just the
   // JSONL audit: the pass trace and the probe are both gated on frame id.
   if (REXCVAR_GET(pinyon_audit) || REXCVAR_GET(pinyon_audit_passes) ||
-      REXCVAR_GET(pinyon_transition_log)) {
+      REXCVAR_GET(pinyon_transition_log) || REXCVAR_GET(fh1_forensics_capture)) {
     rex::graphics::render_audit::SetContext("d3d11", "GTX 570", 1280, 720);
     rex::graphics::render_audit::EnsureStarted();
     rex::graphics::render_audit::SetFrameWindow(
         int32_t(REXCVAR_GET(pinyon_audit_passes_from)),
         int32_t(REXCVAR_GET(pinyon_audit_passes_to)));
     rex::graphics::render_audit::EndFrame(REXCVAR_GET(pinyon_transition_log));
+    // Work after this swap belongs to the frame that is about to be presented,
+    // so the recorder clock leads the just-finished audit frame by one.
+    rex::graphics::render_forensics::SetFrame(rex::graphics::render_audit::FrameId() + 1);
+    rex::graphics::render_forensics::EndFrame();
   }
   // Phase 3 M2: the swap boundary flushes any recorded resolve work before the
   // swap's readback, surface dump or untiling upload reads GPU results. With

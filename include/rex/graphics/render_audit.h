@@ -357,6 +357,20 @@ inline void EndFrame(bool log_transition) {
   // animation stall, not a resolve defect. Independent of the audit file, so
   // it works with the audit switched off.
   if (log_transition) {
+    // G11: keep the transition log bounded by rotating it at 1 MB.
+    {
+      std::FILE* probe = std::fopen("E:/PinyonShift/work/.local/transition.log", "rb");
+      if (probe) {
+        std::fseek(probe, 0, SEEK_END);
+        const long size = std::ftell(probe);
+        std::fclose(probe);
+        if (size > 1024 * 1024) {
+          std::remove("E:/PinyonShift/work/.local/transition.log.1");
+          std::rename("E:/PinyonShift/work/.local/transition.log",
+                      "E:/PinyonShift/work/.local/transition.log.1");
+        }
+      }
+    }
     std::FILE* transition = std::fopen("E:/PinyonShift/work/.local/transition.log", "a");
     if (transition) {
       std::fprintf(transition, "frame=%llu wide=%llu",
@@ -773,6 +787,12 @@ inline void NoteProbe(const ProbeInfo& info) {
   detail::JU64(f, info.max_a);
   detail::JEnd(f);
   std::fflush(f);
+}
+
+inline uint64_t FrameId() {
+  detail::State& s = detail::Get();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  return s.frame;
 }
 
 inline const char* PassPath() { return detail::Get().pass.path.c_str(); }

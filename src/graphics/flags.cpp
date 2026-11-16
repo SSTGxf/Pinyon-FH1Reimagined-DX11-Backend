@@ -93,6 +93,27 @@ REXCVAR_DEFINE_BOOL(pinyon_audit_passes, false, "GPU",
                      "and each resolve with its rectangle, source occupancy and destination write "
                      "coverage per 16-row band")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_forensics_capture, false, "GPU",
+                    "Record a bounded forensics event stream for the frame window below")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(fh1_forensics_from, 0, "GPU",
+                     "First presented frame recorded by the forensics capture")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_forensics_to, 0, "GPU",
+                     "Last presented frame recorded (0 with from=0 captures nothing)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_forensics_event_mask, -1, "GPU",
+                     "Forensics event bitmask (-1 records every enabled kind)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_forensics_ring_events, 65536, "GPU",
+                     "Bounded forensics ring size; overflow is counted and reported")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_forensics_include_binds, false, "GPU",
+                    "Include texture and constant-buffer bindings in the stream")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(fh1_forensics_include_uploads, false, "GPU",
+                    "Include guest-to-host uploads in the stream")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_BOOL(pinyon_msaa_probe, false, "GPU",
                      "Record MSAA source provenance for the 4x resolves of the captured "
                      "frame: format support bits, the three-resource readback chain and its validity")

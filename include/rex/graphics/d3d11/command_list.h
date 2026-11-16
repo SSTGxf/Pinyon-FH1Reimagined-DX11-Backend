@@ -278,7 +278,7 @@ class D3D11CommandList {
   template <typename T>
   T* Append() {
     if (overflow_ || commands_.size() >= max_packets_) {
-      overflow_ = true;
+      MarkOverflow();
       return nullptr;
     }
     commands_.emplace_back(T{});
@@ -287,7 +287,9 @@ class D3D11CommandList {
 
   // Copies bytes into the arena and returns their span. Returns false and sets
   // overflow when the arena cap would be exceeded; the output span is cleared.
-  bool AppendBytes(const void* data, size_t size, D3D11ArenaSpan& span_out);
+  // packet_type identifies the packet whose payload is being recorded.
+  bool AppendBytes(const void* data, size_t size, D3D11ArenaSpan& span_out,
+                   const char* packet_type = "unknown");
 
   // Appends an UploadBuffer packet with its bytes copied into the arena (the
   // mirror-upload recording path, Phase 2 H42). Returns false and sets overflow
@@ -311,6 +313,8 @@ class D3D11CommandList {
   size_t command_count() const { return commands_.size(); }
   size_t arena_bytes() const { return arena_.size(); }
   bool overflowed() const { return overflow_; }
+  // Cumulative across Reset(), which only clears the sticky overflow state.
+  uint32_t overflow_count() const { return overflow_count_; }
 
   const std::vector<D3D11Command>& commands() const { return commands_; }
 
@@ -318,11 +322,21 @@ class D3D11CommandList {
   const uint8_t* Data(D3D11ArenaSpan span) const;
 
  private:
+  bool MarkOverflow() {
+    if (overflow_) {
+      return false;
+    }
+    overflow_ = true;
+    ++overflow_count_;
+    return true;
+  }
+
   std::vector<D3D11Command> commands_;
   std::vector<uint8_t> arena_;
   size_t max_packets_ = kMaxPackets;
   size_t max_arena_bytes_ = kMaxArenaBytes;
   bool overflow_ = false;
+  uint32_t overflow_count_ = 0;
 };
 
 }  // namespace rex::graphics::d3d11

@@ -421,7 +421,8 @@ bool D3D11Fh1NativeResolve::RecordResolveMemory(D3D11CommandList& tape, const So
   // The constants reach the replay through the arena, not through a shared
   // buffer a later resolve would overwrite before the tape is submitted.
   D3D11ArenaSpan constants_span;
-  if (!tape.AppendBytes(plan.constants, sizeof(plan.constants), constants_span)) {
+  if (!tape.AppendBytes(plan.constants, sizeof(plan.constants), constants_span,
+                        "D3D11DispatchPacket")) {
     return false;
   }
   D3D11DispatchPacket* packet = tape.Append<D3D11DispatchPacket>();

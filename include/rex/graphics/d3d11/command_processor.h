@@ -297,6 +297,7 @@ class D3D11CommandProcessor : public CommandProcessor {
   // the readback's own Map orders the copy after it. So a refresh skips the
   // wait (and the tape replay, which only matters when a resolve landed)
   // when resolve_call_count_ is unchanged since the last refresh wait.
+  // d3d11_skip_texture_refresh disables this batching for diagnostics.
   // refresh_waited_resolve_count_ is the resolve count at that wait.
   uint64_t refresh_waited_resolve_count_ = 0;
   bool refresh_waited_ = false;
