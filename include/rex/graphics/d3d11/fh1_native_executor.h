@@ -96,6 +96,7 @@ struct D3D11Fh1NativeExecutorConfig {
   // anything else with a logged reason rather than drawing into the wrong-sized
   // surfaces.
   uint32_t scale = 1;
+  uint32_t untile_height = kFh1D3D11UntileHeight;
   // The command processor's native surface registry - the same one the resolve
   // path reads.
   D3D11Fh1NativeSurfaces* surfaces = nullptr;
@@ -151,13 +152,19 @@ class D3D11Fh1NativeExecutor {
                                                        int32_t y0, int32_t x1, int32_t y1) const;
 
   // After the command processor issued the draw.
-  void NativeDrawIssued(const Fh1DrawInfo& draw);
+  void NativeDrawIssued(const Fh1DrawInfo& draw, uint32_t untile_band);
+
+  // Copies the most recently rendered screen band of each surface back to
+  // EDRAM row zero before the next band-zero resolve.
+  bool EndUntiledTiling();
+  bool has_untile_bands() const { return !untile_bands_.empty(); }
+  uint32_t untile_height() const { return config_.untile_height; }
 
   // A resolve-time clear: claims the guest's tiles, inherits previous contents
   // for partially covered tiles, then clears only the requested pixel rectangle.
   bool ResolveClear(const Fh1SurfaceKey& key, int32_t x0, int32_t y0, int32_t x1, int32_t y1,
-                    uint32_t clear_value, uint32_t clear_value_lo, bool clear_depth = true,
-                    bool clear_stencil = true);
+                    uint32_t clear_value, uint32_t clear_value_lo, uint32_t untile_band = 0,
+                    bool clear_depth = true, bool clear_stencil = true);
 
   // After a resolve read its source through ResolveSourceOwner.
   void OwnerResolveIssued() { ++owner_resolves_; }
@@ -202,9 +209,9 @@ class D3D11Fh1NativeExecutor {
   // Transfers the rectangles of the run. Same host format, geometry and sample
   // count: CopySubresourceRegion; otherwise the transfer shader for the
   // destination and source kinds. Anything else is counted and skipped.
-  void TransferRects(const SurfaceKey& dest_key, D3D11Fh1NativeSurface& dest,
+  bool TransferRects(const SurfaceKey& dest_key, D3D11Fh1NativeSurface& dest,
                      uint32_t previous_owner, const RECT* rects, uint32_t rect_count,
-                     uint32_t tile_count, bool stencil);
+                     uint32_t tile_count, bool stencil, uint32_t source_row_offset = 0);
 
   // A depth destination's tiles, through the EDRAM words pass: the previous
   // owner's words are computed once per destination sample by a compute
@@ -213,9 +220,10 @@ class D3D11Fh1NativeExecutor {
   // also resets stencil) and, when the source may hold a nonzero stencil, one
   // pass per stencil bit. Direct instead runs the same passes straight from the
   // source, with no words buffer and no compute dispatch at all.
-  void TransferDepthRects(const SurfaceKey& dest_key, D3D11Fh1NativeSurface& dest,
+  bool TransferDepthRects(const SurfaceKey& dest_key, D3D11Fh1NativeSurface& dest,
                           D3D11Fh1NativeSurface& source, const RECT* rects,
-                          uint32_t rect_count, uint32_t tile_count, bool stencil);
+                          uint32_t rect_count, uint32_t tile_count, bool stencil,
+                          uint32_t source_row_offset = 0);
   // Whether the direct (dispatch-free) depth path reproduces the words pass for
   // this source: it keeps the default 32x snorm scale, which the words pass
   // takes from the fixed16 flag, so a 16_16 source under the truncating scale
@@ -263,6 +271,7 @@ class D3D11Fh1NativeExecutor {
   Fh1EdramTiles tiles_;
 
   bool initialized_ = false;
+  std::unordered_map<uint32_t, uint32_t> untile_bands_;
   // Targets PrepareTargets derived for the draw BindTargets binds.
   bool pending_targets_valid_ = false;
   uint32_t pending_used_bits_ = 0;
