@@ -89,6 +89,24 @@ trace or a pixel-level probe before it was written down.
   D3D11 is a feature integration, not a flag flip. Includes the
   baseline→0.9.1 graphics-layer diff (51 files).
 
+## Memexport — the prime suspect (2026-11-18)
+
+- `dx11-memexport-2026-11-18.md` — **D3D11 launched on the GTX 570 at
+  60 FPS (a first), but the world is still white above the road strip.**
+  The command processor drops every draw whose vertex or pixel shader
+  writes memexport (no VS UAVs at FL 11_0) and there is no Step C
+  transfer handling anywhere. Correction: the translator DOES emit the
+  memexport stores — the defect is the missing carrier, not a missing
+  store. Pixel-shader carry is dead, stream-output replay is not yet
+  defensible, and the open route is CPU-side shader interpretation.
+  **Counter bug:** the summary printed `skipped_memexport` (never
+  incremented) instead of `dropped_memexport` (never printed), so every
+  memexport log reading so far was 0 and meaningless. Phase 1 fix (split
+  counters + per-draw trace) implemented in the 0.9.1 tree only — the D:
+  tree / this repo's source does not have it yet. A translator change in
+  the same tree (SM 5.0 vertex-shader early return removed) is flagged
+  as NOT verified.
+
 ## Open items (2026-11-17)
 
 - **Prime suspect: `source_row_offset = untile_band`**
@@ -107,3 +125,21 @@ trace or a pixel-level probe before it was written down.
 - **Draw #23 wipe** in a live gameplay frame (unmeasured); **t7 mirror
   staleness** (separate bug); **blue tint** (fetch-level R/B swizzle);
   **NaN-in-bloom** (Corrado car-preview black box).
+
+## Open items (2026-11-18)
+
+- **Row math — RESOLVED (2026-11-17).** `Fh1D3D11UntileBand` returns
+  the row offset (0/256/512), not the band index; `plan.y0` is already
+  the band's real rows. The `source_row_offset = 0` fix is applied in
+  both the 0.9.1 port and the D: tree, but NOT proven in-game (first
+  test: world gone in car-preview view; free-roam retest pending).
+- **0.9.1 port — DONE.** Full-game build succeeded 06:01 AM PC time;
+  D3D11 launched on the GTX 570 at 60 FPS. In-game: white screen + road
+  strip only; sustained free roam NOT confirmed.
+- **Memexport — prime suspect.** Run the instrumented build, measure the
+  vertex/pixel drop split, then build the CPU route. Apply the Phase 1
+  counter fix to the D: tree. Review the translator early-return removal
+  before it ships.
+- **Resolve probe gate fix pending** (drop `untile_band == 2` or use a
+  rect check), store-probe budget raise, staging-log enclosing
+  condition — re-measure after the memexport fix.

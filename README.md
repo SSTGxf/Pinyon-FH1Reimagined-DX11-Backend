@@ -36,13 +36,21 @@ the edram3d probe, and the resolve probe. The full reports are in
 
 ## Source status (2026-11-18)
 
-- **0.9.1 port — backend in.** The D3D11 backend is ported into the Pinyon
-  Shift 0.9.1 source: the 17-file `d3d11/` backend, CMake wiring
-  (`REXGLUE_USE_D3D11`), and DirectX 11 selectable in the launcher (the
-  schema-27 Vulkan force is removed). The SDK DLL built:
-  `rexgpu-fh1.dll`, 3,578,880 B. The full 0.9.1 game (`pinyon_shift.exe`)
-  is NOT built yet — its preset configure is blocked on the `cli11`
-  submodule.
+- **0.9.1 port — backend in, full game BUILT.** The D3D11 backend is
+  ported into the Pinyon Shift 0.9.1 source: the 17-file `d3d11/` backend,
+  CMake wiring (`REXGLUE_USE_D3D11`), and DirectX 11 selectable in the
+  launcher (the schema-27 Vulkan force is removed). The SDK DLL built:
+  `rexgpu-fh1.dll`, 3,578,880 B. **The full 0.9.1 game build SUCCEEDED
+  06:01 AM PC time** (`pinyon_shift.exe` 65,656,320 B, `rexgpu-fh1.dll`
+  14,447,616 B, `rexruntime.dll` 13,905,408 B) — the `cli11` configure
+  block is cleared.
+- **D3D11 LAUNCHED on the GTX 570 at 60 FPS — a first.** The DX11 build
+  was installed into the launcher location (new exe/DLLs in the install,
+  both configs say `d3d11` + GTX adapter, stock files backed up). The
+  runtime shows DirectX 11 + FH1 Native Executor. In-game: white screen,
+  then past the licence screen — a road visible as a strip at the bottom,
+  everything above the line white/blank (no geometry, no 3D, no untiles).
+  Sustained free roam is NOT confirmed.
 - **source_row_offset fix — applied, NOT proven.** `command_processor.cpp:5172`
   is now `constexpr uint32_t source_row_offset = 0;` (was the stale
   `untile_band`), in both the 0.9.1 port and the D: tree. Row math is
@@ -56,15 +64,37 @@ the edram3d probe, and the resolve probe. The full reports are in
   roam, and no free-roam retest or probe verdict has landed yet. If free
   roam also shows no world, revert the fix and retest — the pre-fix state
   was flat-grey-but-present. The render bug is NOT fixed.
+- **Memexport — the prime suspect.** The command processor deliberately
+  drops every draw whose vertex or pixel shader writes memexport (D3D11
+  FL 11_0 has no vertex-shader UAVs), and the executor skips them too —
+  there is no Step C memexport transfer handling anywhere. The translator
+  DOES emit the memexport stores (an earlier "missing store" claim was
+  wrong); the defect is the missing CARRIER, not a missing store. Pixel-
+  shader carry is dead (cannot preserve one ordered export per vertex);
+  stream-output replay is not yet defensible (no SO support, no proven
+  event bound, no ordered replay). The open route is CPU-side shader
+  interpretation (`interpreter.cpp`, `ExportSink` with `kExportAddress` /
+  `kExportData0..4`). See
+  [`docs/findings/dx11-memexport-2026-11-18.md`](docs/findings/dx11-memexport-2026-11-18.md).
+- **Counter bug — found and fixed in the 0.9.1 tree.** The per-frame
+  summary printed `skipped_memexport`, which is NEVER incremented, while
+  the drop increments `dropped_memexport`, which was never printed — so
+  every `skipped[memexport=N]` log reading was always 0 and meaningless.
+  Copilot implemented the fix (summary prints `dropped_memexport` plus
+  new `dropped_memexport_vertex` / `dropped_memexport_pixel` split
+  counters and a per-draw drop trace) in the 0.9.1 tree only. **The D:
+  tree — the source in this repo — does NOT yet have the fix.** A
+  translator change in the same tree (removal of the SM 5.0 vertex-shader
+  early return) is flagged in the report as NOT verified and needs review
+  before it ships.
 - **Launcher — DirectX 11 + GPU selector.** The installed launcher now
   shows DirectX 11 and a GPU dropdown (GTX 570 / RX 5700 XT / Auto); see
   [`launcher-gpu-selector/`](launcher-gpu-selector/).
   `set-graphics-experiment.ps1` accepts `d3d11` and a `D3d11Adapter` that
   writes `d3d11_adapter` to `pinyon_shift.toml` (verified saved:
-  `graphics_api: d3d11`, `d3d11_adapter: GTX`). Note: the installed 0.9.1
-  game is still the stock build, so it has no D3D11 backend yet — the
-  setting saves but the game cannot run D3D11 until the 0.9.1 full-game
-  build lands.
+  `graphics_api: d3d11`, `d3d11_adapter: GTX`). The DX11 build is now
+  installed in the launcher location, so the setting runs the real D3D11
+  backend.
 - **Built binaries.** The DLLs are binary and are NOT committed here. They
   are collected on the PC in `D:\PinyonShift\work\testkit-dlls-20261118\`
   (`rexgpu-fh1-d11-rowfix.dll`, `rexgpu-fh1-091-port.dll`, and the rebuilt
@@ -238,31 +268,39 @@ not used as an explanation for the grey EDRAM surface.
 | Draw #23 blend state | Verified correct |
 | Draw #23 interpolants / system constant | Not captured |
 | t7 mirror | Confirmed separate defect |
-| 0.9.1 port | Backend in, SDK DLL built (3,578,880 B); full-game exe NOT built — configure blocked on cli11 |
-| Launcher | DirectX 11 + GPU selector (GTX 570 / RX 5700 XT / Auto); setting saves (`d3d11`, `d3d11_adapter: GTX`) |
+| 0.9.1 port | Full-game build SUCCEEDED (06:01 AM PC time); D3D11 launched on GTX 570 at 60 FPS (first); in-game white screen + road strip only, sustained free roam NOT confirmed |
+| Memexport draws | Dropped by the command processor (no VS UAVs at FL 11_0) — prime suspect; no Step C transfer handling; translator DOES emit the stores, the carrier is missing |
+| Memexport counter | Bug found: summary printed `skipped_memexport` (never incremented) instead of `dropped_memexport` (never printed); Phase 1 fix (split counters + per-draw trace) in the 0.9.1 tree only — NOT in this repo's D: source yet |
+| CPU memexport route | Designed (interpreter + ExportSink); measurement blocked until the instrumented build runs |
+| Launcher | DirectX 11 + GPU selector (GTX 570 / RX 5700 XT / Auto); setting saves (`d3d11`, `d3d11_adapter: GTX`); DX11 build installed in the launcher location |
 
-Menus, cutscenes, and the 2D HUD render fine. Before the rowfix, in free
-roam the world was flat grey and composite draw #23 wiped the composed
-frame to black. EDRAM gets coloured (Phase 2e probe #7: 28.9% changed,
+Menus, cutscenes, and the 2D HUD render fine. D3D11 now launches on the
+GTX 570 at 60 FPS, but in free roam the world is still white above the
+road strip. EDRAM gets coloured (Phase 2e probe #7: 28.9% changed,
 sky-blue), so the colour is lost in the resolve or the composite — not in
-the 3D render. After the rowfix, the first test showed the world gone in
-the car-preview view; a free-roam retest is pending, so the fix is
-unproven and the render bug is NOT fixed.
+the 3D render — and the memexport drop is now the prime suspect: every
+draw whose vertex or pixel shader writes memexport is dropped before it
+reaches the GPU, with no transfer handling anywhere. After the rowfix,
+the first test showed the world gone in the car-preview view; a free-roam
+retest is pending, so the fix is unproven and the render bug is NOT
+fixed.
 
 **Performance:** D3D11 free roam runs 4–5 FPS on the GTX 570. The
 bottleneck is a single CPU decoder thread (~76% of frame time) plus
 workload streaming. 30 FPS at 720p is the realistic target.
 
-**Next, in order:** (1) free-roam retest of the rowfix — drive into free
-roam on the D: rebuild and check whether the world renders; if it is still
-gone, revert the fix and retest (pre-fix was flat-grey-but-present);
-(2) fix the resolve probe gate on D: (drop `untile_band == 2` or use a
-rect check), raise the store-probe budget, and determine the staging log's
-enclosing condition, then re-run and read the resolve probe lines — that
-splits the remaining loss into dispatch-failure vs copy-failure vs
-composite; (3) unblock the 0.9.1 full-game build (cli11 submodule) so the
-ported D3D11 backend ships in the game, and re-apply the Nov 16–17
-probes there. Full detail: [`docs/findings/`](docs/findings/).
+**Next, in order:** (1) run the instrumented 0.9.1 build to free roam
+and measure the real vertex/pixel memexport drop split from all rotated
+logs; (2) build the CPU memexport route (sink pairing
+`kExportAddress` / `kExportData0..4`, writable write path, command-
+processor call site, interpreter timing measured); (3) after the memexport
+fix, re-measure the resolve/composite path — fix the resolve probe gate
+on D: (drop `untile_band == 2` or use a rect check) and determine whether
+the loss is dispatch vs copy vs composite; (4) apply the Phase 1 counter
+fix to the D: tree so it lands in this repo's source; (5) free-roam
+retest of the rowfix on the D: rebuild — if the world is still gone,
+revert the fix and retest (pre-fix was flat-grey-but-present). Full
+detail: [`docs/findings/`](docs/findings/).
 
 ## Upstream
 - Frame generation (DLSS, FSR, LGSS) is landing upstream; the plan here is
@@ -279,9 +317,9 @@ probes there. Full detail: [`docs/findings/`](docs/findings/).
   `include/rex/graphics/fh1_edram_surfaces.h` — EDRAM tile ownership and
   surface keys
 - `docs/DX11_FINISH_NOTES.md` — running log, phase by phase
-- `docs/findings/` — investigation reports and probe diffs, Nov 15–17
+- `docs/findings/` — investigation reports and probe diffs, Nov 15–18
   (call logger, Vulkan cross-check, edram3d + resolve probes, 0.9.1
-  alignment, backend audit), with an index in `docs/findings/README.md`
+  alignment, backend audit, memexport), with an index in `docs/findings/README.md`
 - `docs/hardware-constraints.md` — why the backend is shaped the way it is
 - `docs/dx12-phase0/` — the D3D12 phase 0–3 inventory and results (context
   for where this backend came from)
