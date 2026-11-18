@@ -34,6 +34,42 @@ Nov 16–17 source, including the per-surface band bitmask, the call logger,
 the edram3d probe, and the resolve probe. The full reports are in
 [`docs/findings/`](docs/findings/).
 
+## Source status (2026-11-18)
+
+- **0.9.1 port — backend in.** The D3D11 backend is ported into the Pinyon
+  Shift 0.9.1 source: the 17-file `d3d11/` backend, CMake wiring
+  (`REXGLUE_USE_D3D11`), and DirectX 11 selectable in the launcher (the
+  schema-27 Vulkan force is removed). The SDK DLL built:
+  `rexgpu-fh1.dll`, 3,578,880 B. The full 0.9.1 game (`pinyon_shift.exe`)
+  is NOT built yet — its preset configure is blocked on the `cli11`
+  submodule.
+- **source_row_offset fix — applied, NOT proven.** `command_processor.cpp:5172`
+  is now `constexpr uint32_t source_row_offset = 0;` (was the stale
+  `untile_band`), in both the 0.9.1 port and the D: tree. Row math is
+  resolved: `Fh1D3D11UntileBand` returns the row offset (0/256/512), and
+  `plan.y0` already holds the band's real rows, so the fix avoids
+  double-counting. The D: game was rebuilt with the fix (`rexgpu-fh1.dll`
+  11,511,296 B, `pinyon_shift.exe` 61,851,648 B).
+- **First test — world gone, unproven.** The rebuilt D: game showed no
+  world in the car-preview view (flat blue sky, Corrado black box, HUD
+  only). The fix did NOT bring the world back there. That was not free
+  roam, and no free-roam retest or probe verdict has landed yet. If free
+  roam also shows no world, revert the fix and retest — the pre-fix state
+  was flat-grey-but-present. The render bug is NOT fixed.
+- **Launcher — DirectX 11 + GPU selector.** The installed launcher now
+  shows DirectX 11 and a GPU dropdown (GTX 570 / RX 5700 XT / Auto); see
+  [`launcher-gpu-selector/`](launcher-gpu-selector/).
+  `set-graphics-experiment.ps1` accepts `d3d11` and a `D3d11Adapter` that
+  writes `d3d11_adapter` to `pinyon_shift.toml` (verified saved:
+  `graphics_api: d3d11`, `d3d11_adapter: GTX`). Note: the installed 0.9.1
+  game is still the stock build, so it has no D3D11 backend yet — the
+  setting saves but the game cannot run D3D11 until the 0.9.1 full-game
+  build lands.
+- **Built binaries.** The DLLs are binary and are NOT committed here. They
+  are collected on the PC in `D:\PinyonShift\work\testkit-dlls-20261118\`
+  (`rexgpu-fh1-d11-rowfix.dll`, `rexgpu-fh1-091-port.dll`, and the rebuilt
+  WPF + Desktop launcher exe/dll).
+
 ## How it works
 
 The guest (Xbox 360) EDRAM is modelled as a 2048-tile grid. Front-buffer
@@ -134,10 +170,13 @@ each stage exonerated a suspect:
   large textured world triangles (8,700–9,300 verts) and read back
   coloured pixels. The flat grey world is NOT a routing problem and NOT
   missing world draws — the colour is lost downstream of IssueDraw, in
-  the resolve or the composite. Prime suspect: `source_row_offset =
-  untile_band` (`src/graphics/d3d11/command_processor.cpp:5172`) — the
-  stale band shifts the resolve source rect, so a Band-2 resolve likely
-  reads Band 0's rows. See
+  the resolve or the composite. The prime suspect was
+  `source_row_offset = untile_band` (`src/graphics/d3d11/command_processor.cpp:5172`) —
+  the stale band shifts the resolve source rect, so a Band-2 resolve likely
+  reads Band 0's rows. That fix is now applied (`source_row_offset = 0`) in
+  both the 0.9.1 port and the D: tree, but it is NOT proven in-game: the
+  first D: rebuild test showed the world gone in the car-preview view, and
+  a free-roam retest is still pending. See
   [`docs/findings/dx11-resolve-probe-2f-followup-2026-11-17.md`](docs/findings/dx11-resolve-probe-2f-followup-2026-11-17.md)
   and [`docs/findings/`](docs/findings/).
 - **3D texture binding — mechanism works.** All 26 observed binds are
@@ -183,7 +222,7 @@ draws — but it is a lookup texture, so its staleness would cause wrong
 colours, not a flat grey world. It is a real bug, tracked separately, and
 not used as an explanation for the grey EDRAM surface.
 
-## Current status (2026-11-17)
+## Current status (2026-11-18)
 
 | Area | Status |
 |---|---|
@@ -193,33 +232,37 @@ not used as an explanation for the grey EDRAM surface.
 | 3D texture binding mechanism | Working |
 | World geometry reaching EDRAM | Confirmed — triangles reach EDRAM, EDRAM gets coloured |
 | Loss location | Downstream of the EDRAM write: resolve or composite |
-| Prime suspect | `source_row_offset = untile_band` (`d3d11/command_processor.cpp:5172`) — row-math check pending |
-| Resolve probe | Built, but gate (`untile_band == 2`) blocks it — fix pending |
+| source_row_offset fix | Applied (`= 0`, both 0.9.1 port and D: tree) — NOT proven in-game; first test showed world gone in car-preview view, free-roam retest pending |
+| Resolve probe gate | Fixed in the port (plan.y0 == 512 / height 208 check); D: gate still uses stale untile_band |
 | Draw #23 pixel-shader translation | Verified faithful |
 | Draw #23 blend state | Verified correct |
 | Draw #23 interpolants / system constant | Not captured |
 | t7 mirror | Confirmed separate defect |
-| 0.9.1 port | In progress — ShiftGlue SDK source obtained, D3D11 integration next |
+| 0.9.1 port | Backend in, SDK DLL built (3,578,880 B); full-game exe NOT built — configure blocked on cli11 |
+| Launcher | DirectX 11 + GPU selector (GTX 570 / RX 5700 XT / Auto); setting saves (`d3d11`, `d3d11_adapter: GTX`) |
 
-Menus, cutscenes, and the 2D HUD render fine. In free roam the world is
-flat grey and composite draw #23 wipes the composed frame to black. EDRAM
-gets coloured (Phase 2e probe #7: 28.9% changed, sky-blue), so the colour
-is lost in the resolve or the composite — not in the 3D render.
+Menus, cutscenes, and the 2D HUD render fine. Before the rowfix, in free
+roam the world was flat grey and composite draw #23 wiped the composed
+frame to black. EDRAM gets coloured (Phase 2e probe #7: 28.9% changed,
+sky-blue), so the colour is lost in the resolve or the composite — not in
+the 3D render. After the rowfix, the first test showed the world gone in
+the car-preview view; a free-roam retest is pending, so the fix is
+unproven and the render bug is NOT fixed.
 
 **Performance:** D3D11 free roam runs 4–5 FPS on the GTX 570. The
 bottleneck is a single CPU decoder thread (~76% of frame time) plus
 workload streaming. 30 FPS at 720p is the realistic target.
 
-**Next, in order:** (1) finish the row-math check (`Fh1D3D11UntileBand`
-return semantics; `plan.y0`/`plan.y1` population), then patch
-`source_row_offset` to derive the band from the plan rect; (2) fix the
-resolve probe gate (drop `untile_band == 2` or use a rect check), raise
-the store-probe budget, and determine the staging log's enclosing
-condition, then re-run and read the resolve probe lines — that splits the
-remaining loss into dispatch-failure vs copy-failure vs composite;
-(3) port the D3D11 backend into the 0.9.1 ShiftGlue SDK (CMakeLists,
-flags, backend selection) and re-apply the Nov 16–17 probes. Full detail:
-[`docs/findings/`](docs/findings/).
+**Next, in order:** (1) free-roam retest of the rowfix — drive into free
+roam on the D: rebuild and check whether the world renders; if it is still
+gone, revert the fix and retest (pre-fix was flat-grey-but-present);
+(2) fix the resolve probe gate on D: (drop `untile_band == 2` or use a
+rect check), raise the store-probe budget, and determine the staging log's
+enclosing condition, then re-run and read the resolve probe lines — that
+splits the remaining loss into dispatch-failure vs copy-failure vs
+composite; (3) unblock the 0.9.1 full-game build (cli11 submodule) so the
+ported D3D11 backend ships in the game, and re-apply the Nov 16–17
+probes there. Full detail: [`docs/findings/`](docs/findings/).
 
 ## Upstream
 - Frame generation (DLSS, FSR, LGSS) is landing upstream; the plan here is
@@ -247,6 +290,12 @@ flags, backend selection) and re-apply the Nov 16–17 probes. Full detail:
   check, …)
 - `tools/build-d3d11.bat` — Release build from the Pinyon checkout
 - `tools/check_d3d11_gate.py` — gate checker
+- `launcher-gpu-selector/` — the WPF launcher DirectX 11 + GPU selector
+  (MainWindow.xaml/.xaml.cs) and the `set-graphics-experiment.ps1` fix
+  (accepts `d3d11` and `d3d11_adapter`)
+
+Built DLLs are binary and are NOT committed here; they are collected on
+the PC in `D:\PinyonShift\work\testkit-dlls-20261118\`.
 
 ## Build
 
@@ -261,8 +310,9 @@ tools\build-d3d11.bat
 
 That runs VS 2022 BuildTools (`VsDevCmd.bat -arch=amd64`) and
 `cmake --build <checkout>\out\build\win-amd64 --config Release`. The
-checkout's canonical location is `E:\PinyonShift\work\.local\rexglue`;
-the build script carries that path. A clean rebuild is 1225 steps and
+checkout's canonical location is `D:\PinyonShift\work\.local\rexglue`
+(the live tree; `E:\PinyonShift\work` is the baseline/spare copy). The
+build script carries that path. A clean rebuild is 1225 steps and
 exits 0. Build with `CMAKE_BUILD_PARALLEL_LEVEL=4` to avoid clang OOM,
 and verify the DLL strings and exe/dll mtimes after a build before
 claiming a change is in the binary.
@@ -274,8 +324,9 @@ claiming a change is in the binary.
   instrument gap.
 - **The flat grey world — loss is downstream of EDRAM.** EDRAM gets
   coloured (Phase 2e); the colour is lost in the resolve or the composite.
-  Prime suspect: `source_row_offset = untile_band`
-  (`src/graphics/d3d11/command_processor.cpp:5172`).
+  The `source_row_offset` fix (`= 0`) is applied but NOT proven — the
+  first test showed the world gone in the car-preview view, and a
+  free-roam retest is pending. The render bug is NOT fixed.
 - **Draw #23 wipe.** Pixel-shader translation and blend state are both
   verified correct; the fault, if any, is upstream in the shader inputs.
 - **MSAA.** The original game's MSAA implementation is extremely heavy,
