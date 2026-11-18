@@ -5169,7 +5169,10 @@ bool D3D11CommandProcessor::IssueCopy() {
   // The draw path stores each predicated band at its screen rows in the
   // expanded surface; resolve from those same rows without moving the guest
   // destination range.
-  const uint32_t source_row_offset = untile_band;
+  // The plan and owner rectangles already use absolute screen rows. The
+  // shader's extra source-row translation is therefore zero; using the
+  // reset window offset here would misaddress a banded source.
+  constexpr uint32_t source_row_offset = 0;
   const uint32_t resolve_sample_select =
       (plan.sample_select & 0xFFFFu) | (source_row_offset << 16);
   bool trace_resolve = false;
