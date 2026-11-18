@@ -222,11 +222,6 @@ flags, backend selection) and re-apply the Nov 16–17 probes. Full detail:
 [`docs/findings/`](docs/findings/).
 
 ## Upstream
-
-- **nerijs (arcanite24, Pinyon Shift creator/lead)** starred this repo on
-  2026-11-16 — its first stargazer — and wants the DX11 backend in
-  Pinyon's main repo and in lavender-shift (the FH2 native PC port),
-  contingent on the world-rendering fix landing.
 - Frame generation (DLSS, FSR, LGSS) is landing upstream; the plan here is
   textures first, then FSR on top — FSR is not a fix for the textures.
 
