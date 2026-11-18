@@ -2220,6 +2220,65 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   return result;
 }
 
+// FH1 call logger (Phase 2): gate + budget for the "FH1 callog" lines.
+// (Same contract as the D3D11 backend's copy; the two files do not share
+// a translation unit, so each keeps its own counter.)
+static uint32_t g_callog_lines_used = 0;
+static bool g_callog_budget_exhausted_logged = false;
+// Phase 2c: multi-swap trace window. The callog / routing gates fire for
+// swaps in [start, start + span), where span is fh1_debug_trace_span
+// (default 1 = single swap, unchanged behavior). A guest frame spans
+// several presents (one per EDRAM band + one composite), so a span of 4+
+// captures a full guest frame in one run.
+static int32_t Fh1TraceSpan() {
+  const int32_t span = REXCVAR_GET(fh1_debug_trace_span);
+  return span < 1 ? 1 : span;
+}
+static bool Fh1SwapInTraceWindow(uint64_t swap, int32_t start) {
+  if (start <= 0) return false;
+  return swap >= uint64_t(start) &&
+         swap < uint64_t(start) + uint64_t(Fh1TraceSpan());
+}
+static bool Fh1CallogEnabled(uint64_t swap) {
+  const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+  if (!Fh1SwapInTraceWindow(swap, callog_swap)) {
+    return false;
+  }
+  const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);
+  if (budget > 0 && g_callog_lines_used >= uint32_t(budget)) {
+    if (!g_callog_budget_exhausted_logged) {
+      g_callog_budget_exhausted_logged = true;
+      REXGPU_INFO("FH1 callog budget exhausted swap={} budget={}", swap, budget);
+    }
+    return false;
+  }
+  ++g_callog_lines_used;
+  return true;
+}
+
+// Type-3-specific sequence number for the packet census (review
+// correction 5). Incremented once per Type-3 packet, regardless of
+// the callog gate, so the logged t3seq values must be consecutive
+// within a swap; counter_ cannot be used (it advances for Type-0/1/2
+// packets too, so gaps in it are expected).
+static uint64_t g_callog_t3seq = 0;
+
+// Draw-relevant Type-0 registers for the callog reg filter (design 1.3,
+// corrected per review: per REGISTER, not per packet range).
+static bool Fh1CallogRegIsRelevant(uint32_t index) {
+  return index == XE_GPU_REG_RB_COLOR_INFO ||
+         index == XE_GPU_REG_RB_DEPTH_INFO ||
+         index == XE_GPU_REG_RB_MODECONTROL ||
+         index == XE_GPU_REG_RB_SURFACE_INFO ||
+         index == XE_GPU_REG_PA_SC_WINDOW_OFFSET ||
+         index == XE_GPU_REG_PA_SC_VIZ_QUERY ||
+         index == XE_GPU_REG_SQ_VS_CONST || index == XE_GPU_REG_SQ_PS_CONST ||
+         (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+          index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+         (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+          index <= XE_GPU_REG_SHADER_CONSTANT_511_W);
+}
+
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
   // Type-0 packet.
   // Write count registers in sequence to the registers starting at
@@ -2237,6 +2296,34 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   }
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  // FH1 call logger (Phase 2): log the index + value of every
+  // draw-relevant register in the written range, reading the values
+  // back from the register file after the write (design 1.3).
+  // Budget is charged per EMITTED line (design 5.3): the first
+  // version charged once per packet, so a 10-register packet
+  // emitted 10 lines for 1 unit of budget and the cap was
+  // meaningless (80,403 reg lines flowed against an 8192 budget
+  // in the first run). The read-back is from decode_regs(), not
+  // register_file_: the routing-guest line reads decode_regs(),
+  // and when record_split_ is active the two files diverge
+  // (writes land in the decode file first). When record_split_
+  // is off, decode_regs() IS register_file_, so this changes
+  // nothing in that case.
+  auto callog_reg_write = [&]() {
+    // write_one_reg packets write count values to the single register
+    // base_index (the read-back is the final value); range packets
+    // write one value per register starting at base_index.
+    const uint32_t reg_count = write_one_reg ? 1 : count;
+    for (uint32_t i = 0; i < reg_count; ++i) {
+      const uint32_t idx = base_index + i;
+      if (!Fh1CallogRegIsRelevant(idx)) continue;
+      if (!Fh1CallogEnabled(trace_swaps_)) return;
+      REXGPU_INFO(
+          "FH1 callog side=G swap={} kind=reg base={:04X} count={} idx={:04X} "
+          "val={:08X}",
+          trace_swaps_, base_index, count, idx, decode_regs().values[idx]);
+    }
+  };
   if (d3d_skip_visible_ >= 2 && d3d_census_decoder::Active() && d3d_census_decoder::Visible() &&
       D3dCensusSkippableRange(base_index, write_one_reg ? 1 : count)) {
     // DL-1.1: state of a visible buffer.
@@ -2246,12 +2333,14 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
   }
   if (!write_one_reg) {
     WriteRegisterRangeFromRing(reader, base_index, count);
+    callog_reg_write();
     return true;
   }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     PacketWriteRegister(base_index, reg_data);
   }
+  callog_reg_write();
 
   return true;
 }
@@ -2279,6 +2368,8 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+  // FH1 call logger (Phase 2): Type-3 sequence number (review correction 5).
+  ++g_callog_t3seq;
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     const int32_t band2_trace_swap = REXCVAR_GET(fh1_debug_band2_trace_swap);
@@ -2408,6 +2499,14 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
         counter_, trace_ib_depth_, opcode, packet & 1, predicated_out, bin_select_, bin_mask_,
         TilingPassOfSelect(), untile_tiling_, untile_select_all_,
         register_file_->values[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
+  }
+  // FH1 call logger (Phase 2): one line per Type-3 packet (packet census).
+  if (Fh1CallogEnabled(trace_swaps_)) {
+    REXGPU_INFO(
+        "FH1 callog side=G swap={} kind=pkt op={:02X} t3seq={} pred={} out={} "
+        "sel={:016X} mask={:016X} pass={}",
+        trace_swaps_, opcode, g_callog_t3seq, packet & 1, predicated_out ? 1 : 0,
+        bin_select_, bin_mask_, TilingPassOfSelect());
   }
   if (predicated_out) {
     reader->AdvanceRead(count * sizeof(uint32_t));
@@ -2598,6 +2697,17 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
   // Wakes guest threads blocked on a fence word instead of polling it.
   if (cpu_visible_write) system::SignalGpuWrite();
+  // FH1 call logger (Phase 2): resulting bin state after the handler,
+  // for the SET_BIN_* commands that change the state the pkt line logs
+  // (review correction 2). PM4_SET_BIN_SELECT has no handler, so it
+  // has no pktpost line.
+  if ((opcode == PM4_SET_BIN_MASK_LO || opcode == PM4_SET_BIN_MASK_HI ||
+       opcode == PM4_SET_BIN_SELECT_LO || opcode == PM4_SET_BIN_SELECT_HI ||
+       opcode == PM4_SET_BIN_MASK) &&
+      Fh1CallogEnabled(trace_swaps_)) {
+    REXGPU_INFO("FH1 callog side=G swap={} kind=pktpost op={:02X} sel={:016X} mask={:016X}",
+                trace_swaps_, opcode, bin_select_, bin_mask_);
+  }
   return result;
 }
 
@@ -3280,6 +3390,32 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  // FH1 routing probe (stage A: guest command stream). One line per draw
+  // packet decoded at the tile-trace swap, so the report can say whether
+  // triangle world draws exist in the guest stream at all. Purely
+  // diagnostic: log lines only.
+  {
+    const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+    if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+      const auto& routing_regs = decode_regs();
+      const auto routing_color0 =
+          routing_regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      const auto routing_depth0 = routing_regs.Get<reg::RB_DEPTH_INFO>();
+      REXGPU_INFO(
+          "FH1 routing guest: swap={} vb={} prim={} idx={} src={} ok={} mode={} pass={} "
+          "sel={:016X} mask={:016X} winy={} c0={:08X}:f{} d0={:08X}:f{} surf={:08X} split={}",
+          trace_swaps_, counter_, uint32_t(vgt_draw_initiator.prim_type),
+          uint32_t(vgt_draw_initiator.num_indices),
+          uint32_t(vgt_draw_initiator.source_select), draw_succeeded ? 1 : 0,
+          uint32_t(routing_regs.Get<reg::RB_MODECONTROL>().edram_mode),
+          TilingPassOfSelect(), bin_select_, bin_mask_,
+          int32_t(routing_regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset),
+          uint32_t(routing_color0.color_base), uint32_t(routing_color0.color_format),
+          uint32_t(routing_depth0.depth_base), uint32_t(routing_depth0.depth_format),
+          routing_regs.values[XE_GPU_REG_RB_SURFACE_INFO], record_split_ ? 1 : 0);
+    }
+  }
+
   if (!draw_succeeded) {
     unfuse_registers();
   }
@@ -3372,6 +3508,23 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
     const bool viz_query_blocks_draw =
         viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z;
+    // FH1 routing probe (stage B: backend intake). One line per draw record
+    // executed at the tile-trace swap, with the viz-query block flag.
+    {
+      const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+      if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+        const auto& routing_regs = *register_file_;
+        REXGPU_INFO(
+            "FH1 routing record: swap={} prim={} idx={} mode={} pass={} sel={:016X} "
+            "mask={:016X} winy={} viz={}",
+            trace_swaps_, uint32_t(vgt_draw_initiator.prim_type),
+            uint32_t(vgt_draw_initiator.num_indices),
+            uint32_t(routing_regs.Get<reg::RB_MODECONTROL>().edram_mode),
+            current_draw_tiling_pass_, current_draw_bin_select_, current_draw_bin_mask_,
+            int32_t(routing_regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset),
+            viz_query_blocks_draw ? 1 : 0);
+      }
+    }
     const bool trace_band2 = current_draw_band_trace_ && current_draw_tiling_pass_ == 1;
     if (trace_band2 && viz_query_blocks_draw) {
       REXGPU_ERROR(
@@ -3447,6 +3600,14 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             return draw_index >= range.first && draw_index <= range.second;
           });
       if (debug_skip) {
+        // FH1 routing probe (stage B: dropped by fh1_debug_skip_draws).
+        {
+          const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+          if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+            REXGPU_INFO("FH1 routing drop: swap={} prim={} reason=skip_draws",
+                        trace_swaps_, uint32_t(vgt_draw_initiator.prim_type));
+          }
+        }
         if (trace_band2) {
           REXGPU_ERROR(
               "FH1 band2 ERROR: shared drop reason=fh1_debug_skip_draws draw={} "
@@ -3474,6 +3635,15 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy &&
             suppress_bit && (record.band_suppress_mask & suppress_bit);
         if (suppressed) {
+          // FH1 routing probe (stage B: dropped by band suppression).
+          {
+            const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+            if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+              REXGPU_INFO("FH1 routing drop: swap={} prim={} reason=band_suppress pass={}",
+                          trace_swaps_, uint32_t(vgt_draw_initiator.prim_type),
+                          current_draw_tiling_pass_);
+            }
+          }
           if (record.band_trace_frame) {
             REXGPU_INFO(
                 "FH1 band suppression: pass={} select={:016X} mask={:016X} "
@@ -3494,6 +3664,19 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
             REXGPU_INFO(
                 "FH1 band2: shared dispatch packet={:08X} select={:016X} mask={:016X}",
                 packet, current_draw_bin_select_, current_draw_bin_mask_);
+          }
+          // FH1 routing probe (stage B: dispatched to IssueDraw).
+          {
+            const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+            if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+              REXGPU_INFO(
+                  "FH1 routing dispatch: swap={} prim={} mode={} pass={} sel={:016X} "
+                  "mask={:016X}",
+                  trace_swaps_, uint32_t(vgt_draw_initiator.prim_type),
+                  uint32_t(register_file_->Get<reg::RB_MODECONTROL>().edram_mode),
+                  current_draw_tiling_pass_, current_draw_bin_select_,
+                  current_draw_bin_mask_);
+            }
           }
           draw_succeeded = IssueDraw(
               vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
@@ -3826,6 +4009,13 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
     assert_unhandled_case(shader_type);
     return false;
   }
+  // FH1 call logger (Phase 2): shader load (guest address + dword count).
+  if (Fh1CallogEnabled(trace_swaps_)) {
+    REXGPU_INFO("FH1 callog side=G swap={} kind=shaderload src=load type={} addr={:08X} "
+                "dwords={}",
+                trace_swaps_,
+                shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", addr, size_dwords);
+  }
   if (!record_split_ && d3d_skip_visible_ && d3d_census_decoder::Active() &&
       d3d_census_decoder::Visible()) {
     // DL-1.1: done only if a draw that runs comes before the next load.
@@ -3928,6 +4118,13 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   if (shader_type != xenos::ShaderType::kVertex && shader_type != xenos::ShaderType::kPixel) {
     assert_unhandled_case(shader_type);
     return false;
+  }
+  // FH1 call logger (Phase 2): inline shader load (ucode embedded in packet).
+  if (Fh1CallogEnabled(trace_swaps_)) {
+    REXGPU_INFO("FH1 callog side=G swap={} kind=shaderload src=imm type={} addr={:08X} "
+                "dwords={}",
+                trace_swaps_,
+                shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", 0, size_dwords);
   }
   LoadInlineShader(shader_type, uint32_t(reader->read_ptr()),
                    reinterpret_cast<const uint32_t*>(reader->read_ptr()), size_dwords);

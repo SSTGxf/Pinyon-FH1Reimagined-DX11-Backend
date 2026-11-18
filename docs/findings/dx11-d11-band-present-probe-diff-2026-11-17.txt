@@ -1,0 +1,139 @@
+﻿diff --git "a/src\\graphics\\flags.cpp.musebak-band-20261117" "b/src\\graphics\\flags.cpp"
+index fd8726e0..f977b479 100644
+--- "a/src\\graphics\\flags.cpp.musebak-band-20261117"
++++ "b/src\\graphics\\flags.cpp"
+@@ -28,6 +28,10 @@ REXCVAR_DEFINE_INT32(fh1_debug_callog, 0, "GPU",
+                      "presented frame; 0 disables");
+ REXCVAR_DEFINE_INT32(fh1_debug_callog_budget, 8192, "GPU",
+                      "Maximum FH1 callog lines per process; 0 disables the budget cap");
++REXCVAR_DEFINE_INT32(fh1_debug_trace_span, 1, "GPU",
++                     "Number of consecutive presented frames to log FH1 callog / "
++                     "routing lines for, starting at fh1_debug_callog / "
++                     "fh1_debug_tile_trace_swap; 1 = single swap (unchanged behavior)");
+ REXCVAR_DEFINE_INT32(fh1_debug_band2_trace_swap, 0, "GPU",
+                      "Trace FH1 Band 2 packets and draw processing for this PM4 XE_SWAP frame; "
+                      "0 disables");
+diff --git "a/include\\rex\\graphics\\flags.h.musebak-band-20261117" "b/include\\rex\\graphics\\flags.h"
+index dc6f357d..b310eb23 100644
+--- "a/include\\rex\\graphics\\flags.h.musebak-band-20261117"
++++ "b/include\\rex\\graphics\\flags.h"
+@@ -66,6 +66,7 @@ REXCVAR_DECLARE(bool, fh1_swap_fetch_trace);
+ REXCVAR_DECLARE(int32_t, fh1_debug_tile_trace_swap);
+ REXCVAR_DECLARE(int32_t, fh1_debug_callog);
+ REXCVAR_DECLARE(int32_t, fh1_debug_callog_budget);
++REXCVAR_DECLARE(int32_t, fh1_debug_trace_span);
+ REXCVAR_DECLARE(int32_t, fh1_debug_band2_trace_swap);
+ REXCVAR_DECLARE(int32_t, fh1_debug_band_suppress);
+ REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
+diff --git "a/src\\graphics\\command_processor.cpp.musebak-band-20261117" "b/src\\graphics\\command_processor.cpp"
+index 8fedf997..2f4b7109 100644
+--- "a/src\\graphics\\command_processor.cpp.musebak-band-20261117"
++++ "b/src\\graphics\\command_processor.cpp"
+@@ -2225,9 +2225,23 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+ // a translation unit, so each keeps its own counter.)
+ static uint32_t g_callog_lines_used = 0;
+ static bool g_callog_budget_exhausted_logged = false;
++// Phase 2c: multi-swap trace window. The callog / routing gates fire for
++// swaps in [start, start + span), where span is fh1_debug_trace_span
++// (default 1 = single swap, unchanged behavior). A guest frame spans
++// several presents (one per EDRAM band + one composite), so a span of 4+
++// captures a full guest frame in one run.
++static int32_t Fh1TraceSpan() {
++  const int32_t span = REXCVAR_GET(fh1_debug_trace_span);
++  return span < 1 ? 1 : span;
++}
++static bool Fh1SwapInTraceWindow(uint64_t swap, int32_t start) {
++  if (start <= 0) return false;
++  return swap >= uint64_t(start) &&
++         swap < uint64_t(start) + uint64_t(Fh1TraceSpan());
++}
+ static bool Fh1CallogEnabled(uint64_t swap) {
+   const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+-  if (callog_swap <= 0 || swap != uint64_t(callog_swap)) {
++  if (!Fh1SwapInTraceWindow(swap, callog_swap)) {
+     return false;
+   }
+   const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);
+@@ -3382,7 +3396,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // diagnostic: log lines only.
+   {
+     const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+-    if (routing_swap > 0 && trace_swaps_ == uint32_t(routing_swap)) {
++    if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+       const auto& routing_regs = decode_regs();
+       const auto routing_color0 =
+           routing_regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+@@ -3498,7 +3512,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+     // executed at the tile-trace swap, with the viz-query block flag.
+     {
+       const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+-      if (routing_swap > 0 && trace_swaps_ == uint32_t(routing_swap)) {
++      if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+         const auto& routing_regs = *register_file_;
+         REXGPU_INFO(
+             "FH1 routing record: swap={} prim={} idx={} mode={} pass={} sel={:016X} "
+@@ -3589,7 +3603,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+         // FH1 routing probe (stage B: dropped by fh1_debug_skip_draws).
+         {
+           const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+-          if (routing_swap > 0 && trace_swaps_ == uint32_t(routing_swap)) {
++          if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+             REXGPU_INFO("FH1 routing drop: swap={} prim={} reason=skip_draws",
+                         trace_swaps_, uint32_t(vgt_draw_initiator.prim_type));
+           }
+@@ -3624,7 +3638,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+           // FH1 routing probe (stage B: dropped by band suppression).
+           {
+             const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+-            if (routing_swap > 0 && trace_swaps_ == uint32_t(routing_swap)) {
++            if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+               REXGPU_INFO("FH1 routing drop: swap={} prim={} reason=band_suppress pass={}",
+                           trace_swaps_, uint32_t(vgt_draw_initiator.prim_type),
+                           current_draw_tiling_pass_);
+@@ -3654,7 +3668,7 @@ void CommandProcessor::ExecuteDrawRecord(const DrawRecord& record) {
+           // FH1 routing probe (stage B: dispatched to IssueDraw).
+           {
+             const int32_t routing_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+-            if (routing_swap > 0 && trace_swaps_ == uint32_t(routing_swap)) {
++            if (Fh1SwapInTraceWindow(trace_swaps_, routing_swap)) {
+               REXGPU_INFO(
+                   "FH1 routing dispatch: swap={} prim={} mode={} pass={} sel={:016X} "
+                   "mask={:016X}",
+git : warning: in the working copy of 'src\graphics\d3d11\command_processor.cpp.musebak-band-20261117', CRLF will be 
+replaced by LF the next time Git touches it
+At line:1 char:623
++ ... e-diff.txt; git diff --no-index -- src\graphics\d3d11\command_process ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: in the working copy of 'src\graphics\d3d11\command_processor.cpp', CRLF will be replaced by LF the next time 
+Git touches it
+diff --git "a/src\\graphics\\d3d11\\command_processor.cpp.musebak-band-20261117" "b/src\\graphics\\d3d11\\command_processor.cpp"
+index 36ca8dc2..4e50517b 100644
+--- "a/src\\graphics\\d3d11\\command_processor.cpp.musebak-band-20261117"
++++ "b/src\\graphics\\d3d11\\command_processor.cpp"
+@@ -91,9 +91,22 @@ namespace {
+ // off, the swap does not match, or the line budget is exhausted.
+ uint32_t g_callog_lines_used = 0;
+ bool g_callog_budget_exhausted_logged = false;
++// Phase 2c: multi-swap trace window (same contract as the shared command
++// processor's copy). The callog gates fire for swaps in
++// [start, start + span), where span is fh1_debug_trace_span (default 1 =
++// single swap, unchanged behavior).
++int32_t Fh1TraceSpan() {
++  const int32_t span = REXCVAR_GET(fh1_debug_trace_span);
++  return span < 1 ? 1 : span;
++}
++bool Fh1SwapInTraceWindow(uint64_t swap, int32_t start) {
++  if (start <= 0) return false;
++  return swap >= uint64_t(start) &&
++         swap < uint64_t(start) + uint64_t(Fh1TraceSpan());
++}
+ bool Fh1CallogEnabled(uint64_t swap) {
+   const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+-  if (callog_swap <= 0 || swap != uint64_t(callog_swap)) {
++  if (!Fh1SwapInTraceWindow(swap, callog_swap)) {
+     return false;
+   }
+   const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);

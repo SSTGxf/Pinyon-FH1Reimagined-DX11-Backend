@@ -601,6 +601,31 @@ bool D3D11TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
         span_name, start, size, key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
         uint32_t(key.format), uint32_t(key.tiled), pages.first, pages.second);
   };
+  // FH1 follow-up probe (Q4): t7 (136FB000) is the only sampled texture whose
+  // guest memory differs from the GPU mirror. Log the load-path facts for it
+  // whenever it loads: the key's dimensions and guest sizes (does the refresh
+  // range cover this dim=2 texture?), and the page states before the refresh
+  // (gpu_written > 0 means the refresh will land mirror bytes into guest
+  // memory; 0 means guest memory is already authoritative and the load reads
+  // real guest content). Purely diagnostic: reads + log lines only.
+  {
+    static uint32_t t7_load_logs = 0;
+    if (REXCVAR_GET(fh1_swap_fetch_trace) &&
+        (uint32_t(key.base_page) << 12) == 0x136FB000u && t7_load_logs < 8) {
+      ++t7_load_logs;
+      const auto t7_pages = shared_memory().CountValidPages(
+          uint32_t(key.base_page) << 12, d3d11_texture.GetGuestBaseSize());
+      REXGPU_INFO(
+          "FH1 t7 load: swap={} base={:08X} dim={} {}x{}x{} fmt={} tiled={} "
+          "base_size={} mips_size={} pages valid={} gpu_written={} refresh={}",
+          command_processor_.presented_output_frames(), uint32_t(key.base_page) << 12,
+          uint32_t(key.dimension), key.GetWidth(), key.GetHeight(),
+          key.GetDepthOrArraySize(), uint32_t(key.format), uint32_t(key.tiled),
+          d3d11_texture.GetGuestBaseSize(), d3d11_texture.GetGuestMipsSize(),
+          t7_pages.first, t7_pages.second,
+          REXCVAR_GET(fh1_resolve_guest_refresh) ? 1 : 0);
+    }
+  }
   // A resolve writes the GPU mirror of shared memory, not guest memory. Before
   // a CPU-side untiling read of a range the GPU wrote (this is the only place a
   // resolved texture's pixels can come from in this backend), land the mirror's
@@ -1058,6 +1083,80 @@ ID3D11ShaderResourceView* D3D11TextureCache::GetActiveTextureBindfulSRV(
               uint32_t(diag_fetch.base_address) << 12,
               uint32_t(diag_fetch.size_2d.width) + 1, uint32_t(diag_fetch.size_2d.height) + 1,
               uint32_t(diag_fetch.format), uint32_t(diag_fetch.tiled));
+        }
+      }
+    }
+  }
+  // FH1 follow-up probe (Q3): the frame-sized srv-bind log above never fires
+  // for the 3D draws' smaller fetches. Log the bind result for fetches of ANY
+  // size at the gated swap, deduplicated per distinct fetch/binding outcome
+  // and capped, so the world draws' fetches can be correlated with the draw
+  // sequence. Purely diagnostic: reads + log lines only.
+  {
+    const int64_t bind_all_from = REXCVAR_GET(fh1_debug_srv_bind_all_from);
+    if (bind_all_from > 0 &&
+        command_processor_.presented_output_frames() == uint64_t(bind_all_from)) {
+      static uint32_t bind_all_logs = 0;
+      static std::vector<uint64_t> bind_all_seen;
+      // FH1 call logger (Phase 2, review correction 4): one-shot flag for
+      // the budget-exhausted record below.
+      static bool bind_all_exhausted_logged = false;
+      const xenos::xe_gpu_texture_fetch_t all_fetch =
+          register_file().GetTextureFetch(fetch_constant_index);
+      const bool all_valid = binding != nullptr;
+      const bool all_dim_ok =
+          all_valid &&
+          AreDimensionsCompatible(host_shader_binding.dimension, binding->key.dimension);
+      const bool all_texture = all_valid && binding->texture != nullptr;
+      const bool all_srv =
+          all_texture &&
+          static_cast<D3D11Texture*>(binding->texture)->srv() != nullptr;
+      uint64_t all_key = 1469598103934665603ull;
+      const uint32_t all_fields[12] = {
+          fetch_constant_index,
+          uint32_t(all_fetch.base_address) << 12,
+          uint32_t(all_fetch.size_2d.width) + 1,
+          uint32_t(all_fetch.size_2d.height) + 1,
+          uint32_t(all_fetch.format),
+          uint32_t(all_fetch.tiled),
+          all_valid ? uint32_t(binding->key.dimension) : 0xFFFFFFFFu,
+          all_valid ? binding->key.GetWidth() : 0,
+          all_valid ? binding->key.GetHeight() : 0,
+          all_valid ? uint32_t(binding->key.format) : 0xFFFFFFFFu,
+          all_valid ? 1u : 0u,
+          (all_texture ? 1u : 0u) | (all_srv ? 2u : 0u) | (all_dim_ok ? 4u : 0u)};
+      for (uint32_t f = 0; f < 12; ++f) {
+        all_key ^= all_fields[f];
+        all_key *= 1099511628211ull;
+      }
+      const bool bind_all_new =
+          std::find(bind_all_seen.begin(), bind_all_seen.end(), all_key) ==
+          bind_all_seen.end();
+      if (bind_all_new && bind_all_logs < 400) {
+        bind_all_seen.push_back(all_key);
+        ++bind_all_logs;
+        REXGPU_INFO(
+            "FH1 srv bind all: swap={} slot={} base={:08X} fetch={}x{} fmt={} tiled={} "
+            "shader_dim={} -> valid={} host={}x{} hostfmt={} hostdim={} texture={} srv={} "
+            "dimok={} signed={}",
+            command_processor_.presented_output_frames(), fetch_constant_index,
+            uint32_t(all_fetch.base_address) << 12,
+            uint32_t(all_fetch.size_2d.width) + 1, uint32_t(all_fetch.size_2d.height) + 1,
+            uint32_t(all_fetch.format), uint32_t(all_fetch.tiled),
+            uint32_t(host_shader_binding.dimension), all_valid ? 1 : 0,
+            all_valid ? binding->key.GetWidth() : 0,
+            all_valid ? binding->key.GetHeight() : 0,
+            all_valid ? uint32_t(binding->key.format) : 0xFFFFFFFFu,
+            all_valid ? uint32_t(binding->key.dimension) : 0xFFFFFFFFu, all_texture ? 1 : 0,
+            all_srv ? 1 : 0, all_dim_ok ? 1 : 0, host_shader_binding.is_signed ? 1 : 0);
+      } else if (bind_all_new) {
+        // A distinct binding arrived after the 400-log cap: record once
+        // so the comparison can tell incomplete evidence from a genuine
+        // missing bind (review correction 4).
+        if (!bind_all_exhausted_logged) {
+          bind_all_exhausted_logged = true;
+          REXGPU_INFO("FH1 srv bind all budget exhausted swap={} distinct={}",
+                      command_processor_.presented_output_frames(), bind_all_logs);
         }
       }
     }

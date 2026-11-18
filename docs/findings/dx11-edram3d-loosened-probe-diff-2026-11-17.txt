@@ -1,0 +1,70 @@
+﻿diff --git "a/E:\\PinyonShift\\work\\.local\\rexglue\\src\\graphics\\d3d11\\command_processor.cpp.musebak-edram3d-20261117" "b/E:\\PinyonShift\\work\\.local\\rexglue\\src\\graphics\\d3d11\\command_processor.cpp"
+index 4e50517..02fefc6 100644
+--- "a/E:\\PinyonShift\\work\\.local\\rexglue\\src\\graphics\\d3d11\\command_processor.cpp.musebak-edram3d-20261117"
++++ "b/E:\\PinyonShift\\work\\.local\\rexglue\\src\\graphics\\d3d11\\command_processor.cpp"
+@@ -3594,19 +3594,38 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+           uint64_t(std::max<int32_t>(REXCVAR_GET(fh1_debug_edram3d_probe_from), 0))) {
+     static uint32_t edram3d_probe_draws = 0;
+     const int32_t edram3d_budget = REXCVAR_GET(fh1_debug_edram3d_probe_draws);
+-    if (edram3d_budget > 0 && edram3d_probe_draws < uint32_t(edram3d_budget) &&
+-        (native_executor_->pending_used_bits() & (1u << 1))) {
+-      const Fh1SurfaceKey edram3d_key = native_executor_->pending_key(1);
+-      const bool edram3d_family = !edram3d_key.is_depth && edram3d_key.base_tiles == 0 &&
+-                                  edram3d_key.pitch_tiles == 32 &&
+-                                  edram3d_key.msaa == uint32_t(xenos::MsaaSamples::k4X);
+-      const bool edram3d_shape =
+-          (primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
+-           primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip ||
+-           primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleFan) &&
+-          used_texture_mask != 0;
+-      D3D11Fh1NativeSurface* edram3d_surface = native_surfaces_->FindSurface(edram3d_key.Pack());
+-      if (edram3d_family && edram3d_shape && edram3d_surface && edram3d_surface->texture) {
++    // Loosened trigger (Phase 2d): scan every bound render-target slot for a
++    // non-depth EDRAM colour surface (base_tiles == 0) instead of hardcoding
++    // slot 1, and drop the pitch/MSAA and used_texture_mask gates. The slot
++    // index is the pending_key index (0 = depth, 1..N = colour RTs), so scan
++    // 0..kMaxColorRenderTargets to cover all four colour RTs.
++    const bool edram3d_is_tri =
++        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
++        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip ||
++        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleFan;
++    if (edram3d_budget > 0 && edram3d_probe_draws < uint32_t(edram3d_budget) && edram3d_is_tri) {
++      const uint32_t edram3d_used_bits = native_executor_->pending_used_bits();
++      Fh1SurfaceKey edram3d_key;
++      D3D11Fh1NativeSurface* edram3d_surface = nullptr;
++      uint32_t edram3d_rt_slot = 0;
++      for (uint32_t rt_slot = 0; rt_slot < 1 + xenos::kMaxColorRenderTargets; ++rt_slot) {
++        if (!(edram3d_used_bits & (1u << rt_slot))) {
++          continue;
++        }
++        const Fh1SurfaceKey candidate_key = native_executor_->pending_key(rt_slot);
++        if (candidate_key.is_depth || candidate_key.base_tiles != 0) {
++          continue;
++        }
++        D3D11Fh1NativeSurface* candidate_surface =
++            native_surfaces_->FindSurface(candidate_key.Pack());
++        if (candidate_surface && candidate_surface->texture) {
++          edram3d_key = candidate_key;
++          edram3d_surface = candidate_surface;
++          edram3d_rt_slot = rt_slot;
++          break;
++        }
++      }
++      if (edram3d_surface) {
+         D3D11_TEXTURE2D_DESC edram3d_desc = {};
+         edram3d_surface->texture->GetDesc(&edram3d_desc);
+         std::vector<uint8_t> edram3d_control;
+@@ -3632,11 +3651,12 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+           edram3d_probe_write_files = edram3d_probe_index <= 3;
+           const uint64_t edram3d_ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+           REXGPU_INFO(
+-              "FH1 edram3d probe control: swap={} probe#{} key={} host={}x{} res_fmt={} "
++              "FH1 edram3d probe control: swap={} probe#{} key={} rt={} texmask={:08X} host={}x{} res_fmt={} "
+               "view_fmt={} samples={} distinct={}/{} control_changed={:.6f} "
+               "control_bbox={},{}-{},{} ps_hash={:016X} verts={}/{} vp={},{} {}x{} "
+               "before_mean={:.6g},{:.6g},{:.6g} px centre={} tl={} tr={} bl={} br={}",
+               presented_output_frames_, edram3d_probe_index, edram3d_key.Describe(),
++              edram3d_rt_slot, used_texture_mask,
+               edram3d_desc.Width, edram3d_desc.Height, uint32_t(edram3d_desc.Format),
+               uint32_t(edram3d_surface->view_format), edram3d_desc.SampleDesc.Count,
+               edram3d_stats_before.distinct, edram3d_stats_control.distinct,

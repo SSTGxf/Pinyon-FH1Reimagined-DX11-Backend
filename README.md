@@ -24,6 +24,16 @@ not because D3D12 is absent.
 
 Full rationale: [`docs/hardware-constraints.md`](docs/hardware-constraints.md).
 
+## Source status (2026-11-17)
+
+The source in this repo now matches the findings below. The 2026-11-16
+README rewrite described the band fix and the EDRAM investigation, but the
+committed source was still the Nov 12 baseline — the fix and the probes
+were not in the tree. That gap is closed: this commit syncs the live
+Nov 16–17 source, including the per-surface band bitmask, the call logger,
+the edram3d probe, and the resolve probe. The full reports are in
+[`docs/findings/`](docs/findings/).
+
 ## How it works
 
 The guest (Xbox 360) EDRAM is modelled as a 2048-tile grid. Front-buffer
@@ -110,29 +120,32 @@ each stage exonerated a suspect:
   only 2 distinct 32-bit words in 3.6 MB, the GPU mirror matches exactly,
   refresh works, and there are zero "texture load rejected" lines. The
   scene target is already nearly black *before* the texture cache reads it.
-- **EDRAM resolve conversion — exonerated.** The resolve source is uniform
-  grey 0.258789 (= RGB 66,66,66) at *every* sample, so the EDRAM dump is
-  representative of the resolve's source. The loss is in the 3D render
-  into EDRAM, upstream of the resolve.
+- **EDRAM resolve conversion — superseded.** An early probe found the
+  resolve source uniform grey 0.258789 (= RGB 66,66,66) at *every* sample,
+  which then pointed the loss at the 3D render into EDRAM. That conclusion
+  is refuted: Phase 2e (2026-11-17) proved EDRAM *does* get coloured
+  (probe #7, band 2: 28.9% changed, sky-blue). The loss is downstream of
+  the EDRAM write — in the resolve or the composite.
+- **World geometry reaches the EDRAM — confirmed (2026-11-17).** The
+  earlier claim that no triangle-geometry draw targets the EDRAM surface
+  is refuted. Phase 2b (Vulkan cross-backend logger) showed D11 issuing
+  1,667 EDRAM-targeting triangles across bands 0/1/2; Phase 2c confirmed
+  EDRAM triangles on D11 in every swap; Phase 2e's edram3d probe fired on
+  large textured world triangles (8,700–9,300 verts) and read back
+  coloured pixels. The flat grey world is NOT a routing problem and NOT
+  missing world draws — the colour is lost downstream of IssueDraw, in
+  the resolve or the composite. Prime suspect: `source_row_offset =
+  untile_band` (`src/graphics/d3d11/command_processor.cpp:5172`) — the
+  stale band shifts the resolve source rect, so a Band-2 resolve likely
+  reads Band 0's rows. See
+  [`docs/findings/dx11-resolve-probe-2f-followup-2026-11-17.md`](docs/findings/dx11-resolve-probe-2f-followup-2026-11-17.md)
+  and [`docs/findings/`](docs/findings/).
 - **3D texture binding — mechanism works.** All 26 observed binds are
   valid (valid=1, texture=1, srv=1, dimok=1), including small fetches. But
   valid SRVs prove the *binding mechanism* only — not that the shader
   samples the intended coordinates, the format/swizzle is interpreted
   correctly, the guest constants reach the translated shader, or the shader
   output is correct.
-- **World geometry never reaches the EDRAM.** The first EDRAM-targeting
-  draw of the frame is a texture-less fullscreen RectangleList pass that
-  writes uniform grey (66,66,66) — the grey is the shader's output, not the
-  clear value (the top band was black before the draw and grey after it; the
-  control readback was pixel-identical). A refined probe for textured
-  triangle draws targeting the EDRAM colour surface (0/32/4x/c3) captured
-  *nothing*: in the investigated frames, **no triangle-geometry draw
-  targets the EDRAM surface at all**. The EDRAM only ever receives the grey
-  fullscreen pass — the most direct explanation for the flat grey world.
-  *Why* the triangle world draws are absent is under investigation now:
-  whether the guest never issues them, the backend drops them before
-  `IssueDraw`, they are routed through the `kCopy` path, or they target a
-  different surface.
 
 ### Draw #23 — the black wipe, narrowed upstream (2026-11-16)
 
@@ -170,36 +183,43 @@ draws — but it is a lookup texture, so its staleness would cause wrong
 colours, not a flat grey world. It is a real bug, tracked separately, and
 not used as an explanation for the grey EDRAM surface.
 
-## Current status (2026-11-16)
+## Current status (2026-11-17)
 
 | Area | Status |
 |---|---|
-| Band 256 / copy-down | Fixed and verified |
-| EDRAM resolve conversion | Exonerated |
+| Band 256 / copy-down | Fixed and verified (per-surface bitmask, in source) |
+| EDRAM resolve conversion | Superseded — EDRAM does get coloured (Phase 2e) |
 | Texture upload chain | Exonerated |
 | 3D texture binding mechanism | Working |
-| World geometry reaching EDRAM | No triangle draws observed |
-| Reason world draws are absent | Unknown — under investigation |
+| World geometry reaching EDRAM | Confirmed — triangles reach EDRAM, EDRAM gets coloured |
+| Loss location | Downstream of the EDRAM write: resolve or composite |
+| Prime suspect | `source_row_offset = untile_band` (`d3d11/command_processor.cpp:5172`) — row-math check pending |
+| Resolve probe | Built, but gate (`untile_band == 2`) blocks it — fix pending |
 | Draw #23 pixel-shader translation | Verified faithful |
 | Draw #23 blend state | Verified correct |
 | Draw #23 interpolants / system constant | Not captured |
 | t7 mirror | Confirmed separate defect |
+| 0.9.1 port | In progress — ShiftGlue SDK source obtained, D3D11 integration next |
 
 Menus, cutscenes, and the 2D HUD render fine. In free roam the world is
-flat grey and composite draw #23 wipes the composed frame to black.
+flat grey and composite draw #23 wipes the composed frame to black. EDRAM
+gets coloured (Phase 2e probe #7: 28.9% changed, sky-blue), so the colour
+is lost in the resolve or the composite — not in the 3D render.
 
 **Performance:** D3D11 free roam runs 4–5 FPS on the GTX 570. The
 bottleneck is a single CPU decoder thread (~76% of frame time) plus
 workload streaming. 30 FPS at 720p is the realistic target.
 
-**Next, in order:** (1) trace the world draw's journey through the command
-processor — does it exist in the guest command stream, reach the backend,
-get classified as rendering or copy, reach `IssueDraw`, and have the EDRAM
-surface selected as its render target; (2) capture draw #23's vertex-shader
-inputs and outputs (interpolant data and `xe_color_exp_bias`) to calculate
-what the faithfully translated pixel shader should output versus the
-observed black wipe. No rendering patch is authorized on the current
-evidence alone.
+**Next, in order:** (1) finish the row-math check (`Fh1D3D11UntileBand`
+return semantics; `plan.y0`/`plan.y1` population), then patch
+`source_row_offset` to derive the band from the plan rect; (2) fix the
+resolve probe gate (drop `untile_band == 2` or use a rect check), raise
+the store-probe budget, and determine the staging log's enclosing
+condition, then re-run and read the resolve probe lines — that splits the
+remaining loss into dispatch-failure vs copy-failure vs composite;
+(3) port the D3D11 backend into the 0.9.1 ShiftGlue SDK (CMakeLists,
+flags, backend selection) and re-apply the Nov 16–17 probes. Full detail:
+[`docs/findings/`](docs/findings/).
 
 ## Upstream
 
@@ -221,9 +241,15 @@ evidence alone.
   `include/rex/graphics/fh1_edram_surfaces.h` — EDRAM tile ownership and
   surface keys
 - `docs/DX11_FINISH_NOTES.md` — running log, phase by phase
+- `docs/findings/` — investigation reports and probe diffs, Nov 15–17
+  (call logger, Vulkan cross-check, edram3d + resolve probes, 0.9.1
+  alignment, backend audit), with an index in `docs/findings/README.md`
 - `docs/hardware-constraints.md` — why the backend is shaped the way it is
 - `docs/dx12-phase0/` — the D3D12 phase 0–3 inventory and results (context
   for where this backend came from)
+- `cmake/` — CMake helper modules (helpers, install, version, PCH, …)
+- `scripts/` — developer scripts (PSReX build/configure/test, Vulkan stack
+  check, …)
 - `tools/build-d3d11.bat` — Release build from the Pinyon checkout
 - `tools/check_d3d11_gate.py` — gate checker
 
@@ -251,8 +277,10 @@ claiming a change is in the binary.
 - **Multisampled depth cannot be read back on D3D11.** Staging cannot
   take MSAA and `ResolveSubresource` has no depth support. That is an open
   instrument gap.
-- **The flat grey world / missing triangle draws.** No triangle-geometry
-  draw targets the EDRAM surface in the investigated frames (see above).
+- **The flat grey world — loss is downstream of EDRAM.** EDRAM gets
+  coloured (Phase 2e); the colour is lost in the resolve or the composite.
+  Prime suspect: `source_row_offset = untile_band`
+  (`src/graphics/d3d11/command_processor.cpp:5172`).
 - **Draw #23 wipe.** Pixel-shader translation and blend state are both
   verified correct; the fault, if any, is upstream in the shader inputs.
 - **MSAA.** The original game's MSAA implementation is extremely heavy,

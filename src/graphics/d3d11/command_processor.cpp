@@ -31,6 +31,15 @@
 
 // Trace-only: the colour render target bound for the most recent draw.
 static std::string g_trace_rt_key;
+
+// FH1 footprint-vs probe once-flags (file scope: the probe blocks live in
+// two different draw functions, and the function holding Block 2 runs
+// before the one holding Blocks 1 and 3, so a shared flag set by the
+// first block to run would block the others). Each block fires on the
+// first A39E draw it sees, then never again.
+static bool g_draw23_vs_vdump_done = false;    // Block 3: vertex data
+static bool g_draw23_vs_vsdump_done = false;   // Block 1: VS ucode/DXBC/meta/fetch
+static bool g_draw23_vs_applied_done = false;  // Block 2: applied exp-bias
 #include <rex/graphics/d3d11/command_list.h>
 #include <rex/graphics/d3d11/fh1_native_resolve.h>
 // Defined once in the D3D12 command processor (same flag, both backends read
@@ -43,7 +52,10 @@ REXCVAR_DECLARE(int32_t, fh1_debug_frontbuffer_draws_from);
 REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_mode);
 REXCVAR_DECLARE(int32_t, fh1_debug_resolve_alias_from_swap);
 REXCVAR_DECLARE(bool, fh1_debug_disable_msaa);
+REXCVAR_DECLARE(bool, fh1_debug_hide_hud);
 REXCVAR_DECLARE(int32_t, fh1_debug_tile_trace_swap);
+REXCVAR_DECLARE(int32_t, fh1_debug_callog);
+REXCVAR_DECLARE(int32_t, fh1_debug_callog_budget);
 REXCVAR_DECLARE(int32_t, fh1_debug_minimap_capture_swap);
 REXCVAR_DECLARE(bool, d3d11_skip_texture_refresh);
 #include <rex/graphics/d3d11/fh1_native_surfaces.h>
@@ -73,6 +85,41 @@ REXCVAR_DEFINE_BOOL(d3d11_band_trace, false, "GPU",
 namespace rex::graphics::d3d11 {
 
 namespace {
+
+// FH1 call logger (Phase 2): gate + budget for the "FH1 callog" lines.
+// Returns true once per line actually emitted; false when the logger is
+// off, the swap does not match, or the line budget is exhausted.
+uint32_t g_callog_lines_used = 0;
+bool g_callog_budget_exhausted_logged = false;
+// Phase 2c: multi-swap trace window (same contract as the shared command
+// processor's copy). The callog gates fire for swaps in
+// [start, start + span), where span is fh1_debug_trace_span (default 1 =
+// single swap, unchanged behavior).
+int32_t Fh1TraceSpan() {
+  const int32_t span = REXCVAR_GET(fh1_debug_trace_span);
+  return span < 1 ? 1 : span;
+}
+bool Fh1SwapInTraceWindow(uint64_t swap, int32_t start) {
+  if (start <= 0) return false;
+  return swap >= uint64_t(start) &&
+         swap < uint64_t(start) + uint64_t(Fh1TraceSpan());
+}
+bool Fh1CallogEnabled(uint64_t swap) {
+  const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+  if (!Fh1SwapInTraceWindow(swap, callog_swap)) {
+    return false;
+  }
+  const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);
+  if (budget > 0 && g_callog_lines_used >= uint32_t(budget)) {
+    if (!g_callog_budget_exhausted_logged) {
+      g_callog_budget_exhausted_logged = true;
+      REXGPU_INFO("FH1 callog budget exhausted swap={} budget={}", swap, budget);
+    }
+    return false;
+  }
+  ++g_callog_lines_used;
+  return true;
+}
 
 // IEEE-754 binary16 -> float, for reading back a 16_16_16_16_FLOAT surface (the
 // storage format of the FH1 scene targets) without depending on F16C.
@@ -885,6 +932,13 @@ void D3D11CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     if (texture_cache_ != nullptr) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
+    // FH1 call logger (Phase 2): texture-fetch constant write (single).
+    if (Fh1CallogEnabled(presented_output_frames_)) {
+      const uint32_t fetch_index =
+          (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6;
+      REXGPU_INFO("FH1 callog side=G swap={} kind=texfetch first={} last={}",
+                  presented_output_frames_, fetch_index, fetch_index);
+    }
     }
     const uint32_t vfetch_index = (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2;
     vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
@@ -984,6 +1038,11 @@ void D3D11CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     uint32_t last_fetch_dword = end_index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0;
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
+    // FH1 call logger (Phase 2): texture-fetch constant write (range).
+    if (Fh1CallogEnabled(presented_output_frames_)) {
+      REXGPU_INFO("FH1 callog side=G swap={} kind=texfetch first={} last={}",
+                  presented_output_frames_, first_fetch_dword / 6, last_fetch_dword / 6);
+    }
     }
     const uint32_t first_vfetch = first_fetch_dword / 2;
     const uint32_t last_vfetch = last_fetch_dword / 2;
@@ -1735,7 +1794,6 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
   (void)primitive_type;
-  (void)index_count;
   (void)major_mode_explicit;
   // Phase 3 M3: a draw consumes the GPU mirror through in-shader fetches, and
   // its target preparation below (BindDrawRenderTargets -> the executor's
@@ -1784,6 +1842,25 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   char dump_c2_after_tag[64] = {};
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  // FH1 routing probe (stage C: IssueDraw entry). One line per draw reaching
+  // the backend's IssueDraw at the tile-trace swap, with the guest primitive
+  // type the tile trace does not record.
+  if (trace_tile) {
+    const auto routing_color0 =
+        regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    auto routing_vs = static_cast<D3D11Shader*>(active_vertex_shader());
+    auto routing_ps = static_cast<D3D11Shader*>(active_pixel_shader());
+    REXGPU_INFO(
+        "FH1 routing issue: swap={} prim={} idx={} mode={} pass={} winy={} c0={:08X}:f{} "
+        "surf={:08X} vs={:016X} ps={:016X}",
+        presented_output_frames_, uint32_t(primitive_type), index_count,
+        uint32_t(edram_mode), current_draw_tiling_pass_,
+        int32_t(regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset),
+        uint32_t(routing_color0.color_base), uint32_t(routing_color0.color_format),
+        regs[XE_GPU_REG_RB_SURFACE_INFO],
+        routing_vs ? routing_vs->ucode_data_hash() : 0,
+        routing_ps ? routing_ps->ucode_data_hash() : 0);
+  }
   if (edram_mode == xenos::EdramMode::kCopy) {
     trace_tile_path("copy_mode");
     return IssueCopy();
@@ -1895,6 +1972,23 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                  /* full_float24_in_0_to_1 */ true, ps_writes_depth,
                                  viewport_info);
 
+  // fh1_debug_hide_hud (diagnostic only): skip HUD/2D overlay draws while
+  // keeping 3D world draws. The HUD renders to its own 1280-wide surfaces
+  // with small viewports (320x192, 160x96, 80x48); the world halves use a
+  // 1280-wide viewport and the post pass 1280x720. A color draw whose
+  // viewport is narrower than the full frame is a HUD draw. Depth-only
+  // passes (shadow maps) are not gated (normalized_color_mask == 0).
+  if (REXCVAR_GET(fh1_debug_hide_hud) && normalized_color_mask != 0 &&
+      viewport_info.xy_extent[0] < 1280u * draw_resolution_scale_x) {
+    if (trace_tile) {
+      REXGPU_INFO("FH1 routing drop: swap={} stage=hide_hud prim={} mode={} pass={}",
+                  presented_output_frames_, uint32_t(primitive_type),
+                  uint32_t(edram_mode), current_draw_tiling_pass_);
+    }
+    ++draw_counters_.dropped_other;
+    return true;
+  }
+
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
   scissor.offset[0] *= draw_resolution_scale_x;
@@ -1934,8 +2028,50 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       claim_x1, claim_y1, bound_depth_and_color_render_target_bits,
       bound_depth_and_color_render_target_formats);
   if (!render_targets_bound) {
+    if (trace_tile) {
+      REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_targets prim={} mode={} pass={}",
+                  presented_output_frames_, uint32_t(primitive_type),
+                  uint32_t(edram_mode), current_draw_tiling_pass_);
+    }
     ++draw_counters_.dropped_targets;
     return false;
+  }
+  // FH1 routing probe (stage E: render-target selection). Log the bound
+  // targets for draws at the tile-trace swap, so the report can say which
+  // surface each triangle draw actually targets.
+  if (trace_tile) {
+    Fh1SurfaceKey routing_c0;
+    Fh1SurfaceKey routing_d;
+    if (native_executor_ && (native_executor_->pending_used_bits() & (1u << 1))) {
+      routing_c0 = native_executor_->pending_key(1);
+    } else {
+      const auto routing_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const uint32_t routing_msaa = uint32_t(routing_surface_info.msaa_samples);
+      const auto routing_color_info =
+          regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      routing_c0 = Fh1SurfaceKey::Color(
+          routing_color_info.color_base,
+          Fh1PitchTiles(routing_surface_info.surface_pitch, routing_msaa), routing_msaa,
+          routing_color_info.color_format,
+          host_render_config_->gamma_render_target_as_unorm16());
+    }
+    if (native_executor_ && (native_executor_->pending_used_bits() & (1u << 0))) {
+      routing_d = native_executor_->pending_key(0);
+    } else if (normalized_depth_control.z_enable ||
+               normalized_depth_control.stencil_enable) {
+      const auto routing_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+      const uint32_t routing_msaa = uint32_t(routing_surface_info.msaa_samples);
+      const auto routing_depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+      routing_d = Fh1SurfaceKey::Depth(
+          routing_depth_info.depth_base,
+          Fh1PitchTiles(routing_surface_info.surface_pitch, routing_msaa), routing_msaa,
+          routing_depth_info.depth_format);
+    }
+    REXGPU_INFO(
+        "FH1 routing bound: swap={} prim={} mode={} pass={} bits={:02X} c0={} d={}",
+        presented_output_frames_, uint32_t(primitive_type), uint32_t(edram_mode),
+        current_draw_tiling_pass_, bound_depth_and_color_render_target_bits,
+        routing_c0.Describe(), routing_d.Describe());
   }
 
   // Obtain shader metadata and configure/bind the pipeline state.
@@ -1951,12 +2087,36 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
       bound_depth_and_color_render_target_formats);
   if (!pipeline) {
+    if (trace_tile) {
+      REXGPU_INFO("FH1 routing drop: swap={} stage={} prim={} mode={} pass={}",
+                  presented_output_frames_,
+                  !vertex_shader_translation->is_valid() ? "dropped_shader"
+                                                         : "dropped_pipeline_state",
+                  uint32_t(primitive_type), uint32_t(edram_mode),
+                  current_draw_tiling_pass_);
+    }
     if (!vertex_shader_translation->is_valid()) {
       ++draw_counters_.dropped_shader;
     } else {
       ++draw_counters_.dropped_pipeline_state;
     }
     return false;
+  }
+
+  // FH1 call logger (Phase 2): shader translation outcome (joins to the
+  // guest shader load by vs/ps hash).
+  if (Fh1CallogEnabled(presented_output_frames_)) {
+    REXGPU_INFO(
+        "FH1 callog side=A swap={} kind=shader vs={:016X} ps={:016X} vvalid={} "
+        "pvalid={} pipeline={:016X}",
+        presented_output_frames_,
+        vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        vertex_shader_translation->is_valid() ? 1 : 0,
+        pixel_shader_translation
+            ? (pixel_shader_translation->is_valid() ? 1 : 0)
+            : -1,
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pipeline)));
   }
 
   uint32_t used_texture_mask =
@@ -2638,9 +2798,160 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           }
         }
       }
+
+      // FH1 footprint-vs probe (draw #23 vertex data): the guest vertex
+      // bytes for this textureless draw. The existing vertex dump is gated
+      // on samples_frame_texture, which is false for #23, so this block has
+      // its own predicate (PS hash at swap 1500) and reads all 48 vertices.
+      // Purely diagnostic: guest-memory reads + log lines only.
+      if (!g_draw23_vs_vdump_done && pixel_shader &&
+          pixel_shader->ucode_data_hash() == 0xA39E23E2FD1F8A8BULL) {
+        g_draw23_vs_vdump_done = true;
+        const auto d23_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+        const uint32_t d23_indx_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+        const uint32_t d23_guest_vertex_count =
+            std::min(primitive_processing_result.guest_draw_vertex_count, 48u);
+        uint32_t d23_guest_indices[48] = {};
+        for (uint32_t i = 0; i < d23_guest_vertex_count; ++i) {
+          d23_guest_indices[i] = (i + d23_indx_offset) & xenos::kVertexIndexMask;
+        }
+        const bool d23_dma_indices =
+            d23_draw_initiator.source_select == xenos::SourceSelect::kDMA && index_buffer_info &&
+            index_buffer_info->guest_base != 0;
+        if (d23_dma_indices) {
+          const bool d23_index_32bit = index_buffer_info->format == xenos::IndexFormat::kInt32;
+          const size_t d23_index_size = d23_index_32bit ? sizeof(uint32_t) : sizeof(uint16_t);
+          for (uint32_t i = 0; i < d23_guest_vertex_count; ++i) {
+            uint8_t d23_index_bytes[4] = {};
+            if (!shared_memory_->CopyCpuRange(
+                    index_buffer_info->guest_base + uint32_t(i * d23_index_size),
+                    std::span<uint8_t>(d23_index_bytes, d23_index_size))) {
+              continue;
+            }
+            uint32_t d23_host_index;
+            if (d23_index_32bit) {
+              std::memcpy(&d23_host_index, d23_index_bytes, sizeof(d23_host_index));
+              d23_host_index = xenos::GpuSwap(d23_host_index, index_buffer_info->endianness);
+            } else {
+              uint16_t d23_host_index_16;
+              std::memcpy(&d23_host_index_16, d23_index_bytes, sizeof(d23_host_index_16));
+              d23_host_index = xenos::GpuSwap(d23_host_index_16, index_buffer_info->endianness);
+            }
+            d23_guest_indices[i] = (d23_host_index + d23_indx_offset) & xenos::kVertexIndexMask;
+          }
+        }
+        REXGPU_INFO(
+            "FH1 draw23 vertex dump: swap={} draw#{} prim={} vertices={} source={} "
+            "index_offset={} indices={},{},{}",
+            presented_output_frames_, composite_draw_logs + 1,
+            uint32_t(primitive_processing_result.guest_primitive_type),
+            d23_guest_vertex_count, d23_dma_indices ? "dma" : "auto", d23_indx_offset,
+            d23_guest_indices[0], d23_guest_indices[1], d23_guest_indices[2]);
+        float d23_position_px_min[2] = {1e30f, 1e30f};
+        float d23_position_px_max[2] = {-1e30f, -1e30f};
+        uint32_t d23_position_count = 0;
+        for (const Shader::VertexBinding& d23_binding : vertex_shader->vertex_bindings()) {
+          const xenos::xe_gpu_vertex_fetch_t d23_vf =
+              regs.GetVertexFetch(d23_binding.fetch_constant);
+          if (d23_vf.type != xenos::FetchConstantType::kVertex) {
+            continue;
+          }
+          const uint32_t d23_base_address = uint32_t(d23_vf.address) << 2;
+          for (const Shader::VertexBinding::Attribute& d23_attribute :
+               d23_binding.attributes) {
+            const ParsedVertexFetchInstruction& d23_fetch_instr = d23_attribute.fetch_instr;
+            const xenos::VertexFormat d23_data_format = d23_fetch_instr.attributes.data_format;
+            if (d23_data_format == xenos::VertexFormat::kUndefined) {
+              continue;
+            }
+            const int d23_component_count =
+                xenos::GetVertexFormatComponentCount(d23_data_format);
+            const bool d23_is_float = d23_data_format == xenos::VertexFormat::k_32_FLOAT ||
+                                      d23_data_format == xenos::VertexFormat::k_32_32_FLOAT ||
+                                      d23_data_format == xenos::VertexFormat::k_32_32_32_FLOAT ||
+                                      d23_data_format == xenos::VertexFormat::k_32_32_32_32_FLOAT;
+            const bool d23_is_position =
+                d23_fetch_instr.result.storage_target == InstructionStorageTarget::kRegister &&
+                d23_fetch_instr.result.storage_index == 0;
+            for (uint32_t v = 0; v < d23_guest_vertex_count; ++v) {
+              const int64_t d23_address_dwords =
+                  int64_t(d23_vf.address) +
+                  int64_t(d23_binding.stride_words) * d23_guest_indices[v] +
+                  int64_t(d23_fetch_instr.attributes.offset);
+              uint32_t d23_data[4] = {};
+              const bool d23_read =
+                  d23_address_dwords >= 0 &&
+                  shared_memory_->CopyCpuRange(
+                      uint32_t(d23_address_dwords) * 4,
+                      std::span<uint8_t>(reinterpret_cast<uint8_t*>(d23_data),
+                                         size_t(d23_component_count) * 4));
+              std::string d23_values;
+              if (!d23_read) {
+                d23_values = "unavailable";
+              } else {
+                for (int c = 0; c < 4; ++c) {
+                  d23_data[c] =
+                      c < d23_component_count ? xenos::GpuSwap(d23_data[c], d23_vf.endian) : 0;
+                }
+                if (d23_is_float) {
+                  float d23_floats[4] = {};
+                  for (int c = 0; c < 4; ++c) {
+                    std::memcpy(&d23_floats[c], &d23_data[c], sizeof(float));
+                  }
+                  d23_values = fmt::format("({:.6g},{:.6g},{:.6g},{:.6g})", d23_floats[0],
+                                           d23_floats[1], d23_floats[2], d23_floats[3]);
+                  if (d23_is_position) {
+                    const float d23_w =
+                        d23_component_count >= 4 && d23_floats[3] != 0.0f ? d23_floats[3] : 1.0f;
+                    const float d23_ndc_x = d23_floats[0] / d23_w;
+                    const float d23_ndc_y = d23_floats[1] / d23_w;
+                    const float d23_px = (d23_ndc_x * viewport_info.ndc_scale[0] +
+                                          viewport_info.ndc_offset[0] + 1.0f) *
+                                             0.5f * float(viewport_info.xy_extent[0]) +
+                                         float(viewport_info.xy_offset[0]);
+                    const float d23_py = (d23_ndc_y * viewport_info.ndc_scale[1] +
+                                          viewport_info.ndc_offset[1] + 1.0f) *
+                                             0.5f * float(viewport_info.xy_extent[1]) +
+                                         float(viewport_info.xy_offset[1]);
+                    d23_values += fmt::format(" ndc=({:.4f},{:.4f}) px=({:.1f},{:.1f})",
+                                              d23_ndc_x, d23_ndc_y, d23_px, d23_py);
+                    d23_position_px_min[0] = std::min(d23_position_px_min[0], d23_px);
+                    d23_position_px_min[1] = std::min(d23_position_px_min[1], d23_py);
+                    d23_position_px_max[0] = std::max(d23_position_px_max[0], d23_px);
+                    d23_position_px_max[1] = std::max(d23_position_px_max[1], d23_py);
+                    ++d23_position_count;
+                  }
+                } else {
+                  for (int c = 0; c < d23_component_count; ++c) {
+                    d23_values += fmt::format("{:08X} ", d23_data[c]);
+                  }
+                }
+              }
+              REXGPU_INFO(
+                  "FH1 draw23 vertex:   slot={} base={:08X} size={} stride={} fmt={} off={} "
+                  "pos={} v{} index={} addr={:08X} {}",
+                  d23_binding.fetch_constant, d23_base_address, uint32_t(d23_vf.size) << 2,
+                  d23_binding.stride_words * 4, uint32_t(d23_data_format),
+                  d23_fetch_instr.attributes.offset, d23_is_position ? 1 : 0, v,
+                  d23_guest_indices[v], uint32_t(d23_address_dwords) * 4, d23_values);
+            }
+          }
+        }
+        if (d23_position_count) {
+          REXGPU_INFO(
+              "FH1 draw23 vertex positions: swap={} draw#{} positions={} "
+              "px_x=[{:.1f},{:.1f}] px_y=[{:.1f},{:.1f}] vp={},{} {}x{}",
+              presented_output_frames_, composite_draw_logs + 1, d23_position_count,
+              d23_position_px_min[0], d23_position_px_max[0], d23_position_px_min[1],
+              d23_position_px_max[1], viewport_info.xy_offset[0], viewport_info.xy_offset[1],
+              viewport_info.xy_extent[0], viewport_info.xy_extent[1]);
+        }
+      }
       // The log has to survive the menus to reach the world phase (400 draws
       // were spent before it in one run, leaving the world draws unnamed).
-      if (composite_draw_logs < 4000 && same_family) {
+      if ((composite_draw_logs < 4000 && same_family) ||
+          (!g_draw23_vs_vsdump_done && pixel_shader &&
+           pixel_shader->ucode_data_hash() == 0xA39E23E2FD1F8A8BULL)) {
         ++composite_draw_logs;
         std::string textures;
         uint32_t texture_remaining = used_texture_mask;
@@ -2671,6 +2982,343 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
             viewport_info.ndc_offset[1]);
         REXGPU_INFO("FH1 composite draw:   textures={} {}", used_texture_mask == 0 ? "none" : "",
                     textures);
+        // FH1 follow-up probe (Q1): which guest state does the backend
+        // misinterpret for draw #23? Log, for each same-family draw at swap
+        // 1500, the pixel shader's identity (ucode hash), the pixel shader's
+        // float constants as the guest set them, the blend state (RB_BLENDCONTROL
+        // for target 0, blend-factor constants, RB_COLORCONTROL, alpha ref),
+        // the raw colour mask, the normalised colour mask, and every bound
+        // colour target. Purely diagnostic: register reads + log lines only.
+        {
+          static uint32_t composite_state_logs = 0;
+          if ((presented_output_frames_ == 1500 && composite_state_logs < 40) ||
+              (!g_draw23_vs_vsdump_done && pixel_shader &&
+               pixel_shader->ucode_data_hash() == 0xA39E23E2FD1F8A8BULL)) {
+            ++composite_state_logs;
+            const uint64_t ps_hash =
+                pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+            const uint64_t vs_hash =
+                vertex_shader ? vertex_shader->ucode_data_hash() : 0;
+            std::string ps_consts;
+            uint32_t ps_float_count = 0;
+            uint32_t ps_consts_logged = 0;
+            if (pixel_shader) {
+              const Shader::ConstantRegisterMap& ps_map =
+                  pixel_shader->constant_register_map();
+              ps_float_count = ps_map.float_count;
+              const uint32_t* ps_first = &regs[XE_GPU_REG_SHADER_CONSTANT_256_X];
+              for (uint32_t r = 0; r < 256 && ps_consts_logged < 16; ++r) {
+                if (!(ps_map.float_bitmap[r >> 6] & (uint64_t(1) << (r & 63)))) {
+                  continue;
+                }
+                float c[4];
+                std::memcpy(c, ps_first + r * 4, sizeof(c));
+                ps_consts += fmt::format(" c{}=({:.6g},{:.6g},{:.6g},{:.6g})", r, c[0],
+                                         c[1], c[2], c[3]);
+                ++ps_consts_logged;
+              }
+              if (ps_consts.empty()) {
+                ps_consts = " (no float constants used)";
+              }
+            } else {
+              ps_consts = " (no pixel shader)";
+            }
+            const auto blend0 =
+                regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+            const auto colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+            const uint32_t raw_color_mask = regs.Get<reg::RB_COLOR_MASK>().value;
+            std::string rt_slots;
+            if (native_executor_) {
+              for (uint32_t slot = 1; slot < 1 + xenos::kMaxColorRenderTargets; ++slot) {
+                if (!(native_executor_->pending_used_bits() & (1u << slot))) {
+                  continue;
+                }
+                rt_slots += fmt::format(
+                    " c{}={}:m{:X}", slot - 1, native_executor_->pending_key(slot).Describe(),
+                    (normalized_color_mask >> (4 * (slot - 1))) & 0xF);
+              }
+            }
+            REXGPU_INFO(
+                "FH1 composite state: swap={} draw#{} ps_hash={:016X} vs_hash={:016X} "
+                "ps_floats={} ps_consts={} blend0=src{} op{} dst{} srcA{} opA{} dstA{} "
+                "blend_factor=({:.6g},{:.6g},{:.6g},{:.6g}) colorcontrol={:08X} "
+                "alpha_test={} alpha_func={} alpha_ref={:.6g} raw_mask={:08X} "
+                "norm_mask={:08X} used_tex_mask={:08X} rt={}",
+                presented_output_frames_, composite_draw_logs, ps_hash, vs_hash,
+                ps_float_count, ps_consts, uint32_t(blend0.color_srcblend),
+                uint32_t(blend0.color_comb_fcn), uint32_t(blend0.color_destblend),
+                uint32_t(blend0.alpha_srcblend), uint32_t(blend0.alpha_comb_fcn),
+                uint32_t(blend0.alpha_destblend),
+                regs.Get<float>(XE_GPU_REG_RB_BLEND_RED),
+                regs.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
+                regs.Get<float>(XE_GPU_REG_RB_BLEND_BLUE),
+                regs.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA), colorcontrol.value,
+                uint32_t(colorcontrol.alpha_test_enable), uint32_t(colorcontrol.alpha_func),
+                regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF), raw_color_mask,
+                normalized_color_mask, used_texture_mask, rt_slots);
+          // FH1 next-evidence probe (Goal 2): draw #23's shader and the
+          // actually-applied blend state. The guest blend registers and the
+          // mapping table are already known; this reads back the
+          // D3D11_BLEND_DESC the pipeline bound for this draw, and dumps the
+          // guest ucode disassembly plus the translated DXBC (and its runtime
+          // disassembly) for draws #23 and #24, so the two shaders can be
+          // compared. Purely diagnostic: reads + file writes + log lines.
+          if (composite_draw_logs >= 23 && composite_draw_logs <= 25) {
+            if (pipeline && pipeline->blend_state) {
+              D3D11_BLEND_DESC applied_blend = {};
+              pipeline->blend_state->GetDesc(&applied_blend);
+              const D3D11_RENDER_TARGET_BLEND_DESC& ab = applied_blend.RenderTarget[0];
+              REXGPU_INFO(
+                  "FH1 draw23 applied blend: swap={} draw#{} ps_hash={:016X} "
+                  "blend_enable={} src={} dst={} op={} srcA={} dstA={} opA={} "
+                  "write_mask={:X} indep={} a2c={}",
+                  presented_output_frames_, composite_draw_logs, ps_hash,
+                  int(ab.BlendEnable), int(ab.SrcBlend), int(ab.DestBlend), int(ab.BlendOp),
+                  int(ab.SrcBlendAlpha), int(ab.DestBlendAlpha), int(ab.BlendOpAlpha),
+                  uint32_t(ab.RenderTargetWriteMask),
+                  int(applied_blend.IndependentBlendEnable),
+                  int(applied_blend.AlphaToCoverageEnable));
+            } else {
+              REXGPU_INFO(
+                  "FH1 draw23 applied blend: swap={} draw#{} ps_hash={:016X} no_blend_state",
+                  presented_output_frames_, composite_draw_logs, ps_hash);
+            }
+          }
+          if ((composite_draw_logs == 23 || composite_draw_logs == 24) && pixel_shader) {
+            const std::string shader_dump_dir = REXCVAR_GET(fh1_debug_composite_dump);
+            if (!shader_dump_dir.empty()) {
+              const std::string& guest_dis = pixel_shader->ucode_disassembly();
+              uint32_t guest_dis_lines = 0;
+              for (char ch : guest_dis) {
+                if (ch == '\n') {
+                  ++guest_dis_lines;
+                }
+              }
+              char guest_path[256];
+              std::snprintf(guest_path, sizeof(guest_path), "%s/draw%u-ps-guest-%016llX.txt",
+                            shader_dump_dir.c_str(), composite_draw_logs,
+                            (unsigned long long)ps_hash);
+              {
+                std::ofstream gf(guest_path, std::ios::binary);
+                if (gf) {
+                  gf << guest_dis;
+                }
+              }
+              const std::vector<uint8_t>* dxbc_bytes = nullptr;
+              if (pixel_shader_translation) {
+                dxbc_bytes = &pixel_shader_translation->translated_binary();
+              }
+              std::string dxbc_path;
+              if (dxbc_bytes && !dxbc_bytes->empty()) {
+                char dxbc_name[256];
+                std::snprintf(dxbc_name, sizeof(dxbc_name), "%s/draw%u-ps-%016llX.dxbc",
+                              shader_dump_dir.c_str(), composite_draw_logs,
+                              (unsigned long long)ps_hash);
+                {
+                  std::ofstream df(dxbc_name, std::ios::binary);
+                  if (df) {
+                    df.write(reinterpret_cast<const char*>(dxbc_bytes->data()),
+                             std::streamsize(dxbc_bytes->size()));
+                  }
+                }
+                dxbc_path = dxbc_name;
+              }
+              std::string dxbc_dis_path;
+              bool dxbc_dis_ok = false;
+              if (dxbc_bytes && !dxbc_bytes->empty()) {
+                using D3DDisassembleFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, UINT, LPCSTR,
+                                                          ID3DBlob**);
+                static HMODULE d3dcompiler = nullptr;
+                static D3DDisassembleFn d3d_disassemble = nullptr;
+                static bool d3dcompiler_tried = false;
+                if (!d3dcompiler_tried) {
+                  d3dcompiler_tried = true;
+                  d3dcompiler = ::LoadLibraryA("d3dcompiler_47.dll");
+                  if (d3dcompiler) {
+                    d3d_disassemble = reinterpret_cast<D3DDisassembleFn>(
+                        ::GetProcAddress(d3dcompiler, "D3DDisassemble"));
+                  }
+                }
+                if (d3d_disassemble) {
+                  Microsoft::WRL::ComPtr<ID3DBlob> dis_blob;
+                  const HRESULT dhr = d3d_disassemble(dxbc_bytes->data(), dxbc_bytes->size(),
+                                                      0, nullptr, &dis_blob);
+                  if (SUCCEEDED(dhr) && dis_blob) {
+                    char dis_name[256];
+                    std::snprintf(dis_name, sizeof(dis_name), "%s/draw%u-ps-dxbc-%016llX.txt",
+                                  shader_dump_dir.c_str(), composite_draw_logs,
+                                  (unsigned long long)ps_hash);
+                    {
+                      std::ofstream df(dis_name, std::ios::binary);
+                      if (df) {
+                        df.write(static_cast<const char*>(dis_blob->GetBufferPointer()),
+                                 std::streamsize(dis_blob->GetBufferSize()));
+                      }
+                    }
+                    dxbc_dis_path = dis_name;
+                    dxbc_dis_ok = true;
+                  }
+                }
+              }
+              REXGPU_INFO(
+                  "FH1 draw23 shader dump: swap={} draw#{} ps_hash={:016X} "
+                  "guest_dis_lines={} guest_file={} dxbc_bytes={} dxbc_file={} "
+                  "dxbc_dis_ok={} dxbc_dis_file={}",
+                  presented_output_frames_, composite_draw_logs, ps_hash, guest_dis_lines,
+                  guest_path, dxbc_bytes ? dxbc_bytes->size() : 0,
+                  dxbc_path.empty() ? "(none)" : dxbc_path.c_str(),
+                  dxbc_dis_ok ? 1 : 0,
+                  dxbc_dis_path.empty() ? "(none)" : dxbc_dis_path.c_str());
+            }
+          }
+
+          // FH1 footprint-vs probe (draw #23 VS): the vertex shader behind
+          // the wipe. Dumps the guest VS ucode + disassembly, the translated
+          // VS DXBC + runtime disassembly, the interpolator writes, the VS
+          // float constants it reads, the per-draw exp-bias scale, and the
+          // full vertex-fetch list - so the values reaching the pixel shader
+          // can be calculated. Purely diagnostic: reads + file writes + log
+          // lines only. Gated on the PS hash, not the draw number.
+          if (!g_draw23_vs_vsdump_done && ps_hash == 0xA39E23E2FD1F8A8BULL &&
+              vertex_shader) {
+            g_draw23_vs_vsdump_done = true;
+            const std::string vs_dump_dir = REXCVAR_GET(fh1_debug_composite_dump);
+            if (!vs_dump_dir.empty()) {
+              const auto vs_ucode_paths = vertex_shader->DumpUcode(vs_dump_dir);
+              const std::vector<uint8_t>* vs_dxbc_bytes = nullptr;
+              if (vertex_shader_translation) {
+                vs_dxbc_bytes = &vertex_shader_translation->translated_binary();
+              }
+              std::string vs_dxbc_path;
+              if (vs_dxbc_bytes && !vs_dxbc_bytes->empty()) {
+                char vs_dxbc_name[256];
+                std::snprintf(vs_dxbc_name, sizeof(vs_dxbc_name),
+                              "%s/draw23-vs-%016llX.dxbc", vs_dump_dir.c_str(),
+                              (unsigned long long)vs_hash);
+                {
+                  std::ofstream vsdf(vs_dxbc_name, std::ios::binary);
+                  if (vsdf) {
+                    vsdf.write(reinterpret_cast<const char*>(vs_dxbc_bytes->data()),
+                               std::streamsize(vs_dxbc_bytes->size()));
+                  }
+                }
+                vs_dxbc_path = vs_dxbc_name;
+              }
+              std::string vs_dxbc_dis_path;
+              bool vs_dxbc_dis_ok = false;
+              if (vs_dxbc_bytes && !vs_dxbc_bytes->empty()) {
+                using VsD3DDisassembleFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, UINT, LPCSTR,
+                                                            ID3DBlob**);
+                static HMODULE vs_d3dcompiler = nullptr;
+                static VsD3DDisassembleFn vs_d3d_disassemble = nullptr;
+                static bool vs_d3dcompiler_tried = false;
+                if (!vs_d3dcompiler_tried) {
+                  vs_d3dcompiler_tried = true;
+                  vs_d3dcompiler = ::LoadLibraryA("d3dcompiler_47.dll");
+                  if (vs_d3dcompiler) {
+                    vs_d3d_disassemble = reinterpret_cast<VsD3DDisassembleFn>(
+                        ::GetProcAddress(vs_d3dcompiler, "D3DDisassemble"));
+                  }
+                }
+                if (vs_d3d_disassemble) {
+                  Microsoft::WRL::ComPtr<ID3DBlob> vs_dis_blob;
+                  const HRESULT vs_dhr = vs_d3d_disassemble(
+                      vs_dxbc_bytes->data(), vs_dxbc_bytes->size(), 0, nullptr, &vs_dis_blob);
+                  if (SUCCEEDED(vs_dhr) && vs_dis_blob) {
+                    char vs_dis_name[256];
+                    std::snprintf(vs_dis_name, sizeof(vs_dis_name),
+                                  "%s/draw23-vs-dxbc-%016llX.txt", vs_dump_dir.c_str(),
+                                  (unsigned long long)vs_hash);
+                    {
+                      std::ofstream vsdf(vs_dis_name, std::ios::binary);
+                      if (vsdf) {
+                        vsdf.write(static_cast<const char*>(vs_dis_blob->GetBufferPointer()),
+                                   std::streamsize(vs_dis_blob->GetBufferSize()));
+                      }
+                    }
+                    vs_dxbc_dis_path = vs_dis_name;
+                    vs_dxbc_dis_ok = true;
+                  }
+                }
+              }
+              REXGPU_INFO(
+                  "FH1 draw23 vs dump: swap={} draw#{} vs_hash={:016X} ucode_bin={} "
+                  "ucode_dis={} dxbc_bytes={} dxbc_file={} dxbc_dis_ok={} dxbc_dis_file={}",
+                  presented_output_frames_, composite_draw_logs, vs_hash,
+                  vs_ucode_paths.first.string(), vs_ucode_paths.second.string(),
+                  vs_dxbc_bytes ? vs_dxbc_bytes->size() : 0,
+                  vs_dxbc_path.empty() ? "(none)" : vs_dxbc_path.c_str(),
+                  vs_dxbc_dis_ok ? 1 : 0,
+                  vs_dxbc_dis_path.empty() ? "(none)" : vs_dxbc_dis_path.c_str());
+            }
+            // VS metadata: which interpolators the VS writes, the float
+            // constants it reads (VS base 0-255), the target-0 colour info,
+            // and the exp-bias scale this draw computes (same rule as
+            // UpdateSystemConstantValues).
+            const Shader::ConstantRegisterMap& vs_map = vertex_shader->constant_register_map();
+            std::string vs_consts;
+            uint32_t vs_consts_logged = 0;
+            const uint32_t* vs_first = &regs[XE_GPU_REG_SHADER_CONSTANT_000_X];
+            for (uint32_t r = 0; r < 256 && vs_consts_logged < 16; ++r) {
+              if (!(vs_map.float_bitmap[r >> 6] & (uint64_t(1) << (r & 63)))) {
+                continue;
+              }
+              float c[4];
+              std::memcpy(c, vs_first + r * 4, sizeof(c));
+              vs_consts += fmt::format(" c{}=({:.6g},{:.6g},{:.6g},{:.6g})", r, c[0], c[1],
+                                       c[2], c[3]);
+              ++vs_consts_logged;
+            }
+            if (vs_consts.empty()) {
+              vs_consts = " (no float constants used)";
+            }
+            const auto vs_color_info =
+                regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+            int32_t vs_exp_bias = vs_color_info.color_exp_bias;
+            if (vs_color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16 ||
+                vs_color_info.color_format == xenos::ColorRenderTargetFormat::k_16_16_16_16) {
+              if (!host_render_config_->IsFixed16TruncatedToMinus1To1()) {
+                vs_exp_bias -= 5;
+              }
+            }
+            const float vs_exp_bias_scale =
+                rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (vs_exp_bias << 23)));
+            REXGPU_INFO(
+                "FH1 draw23 vs meta: swap={} draw#{} vs_hash={:016X} "
+                "writes_interpolators={:04X} vs_floats={} vs_consts={} "
+                "color_fmt={} color_exp_bias={} exp_bias_scale={:.6g}",
+                presented_output_frames_, composite_draw_logs, vs_hash,
+                vertex_shader->writes_interpolators(), vs_map.float_count, vs_consts,
+                uint32_t(vs_color_info.color_format),
+                int32_t(vs_color_info.color_exp_bias), vs_exp_bias_scale);
+            // VS fetch list: every vertex binding and attribute, so the
+            // formats feeding exports 0/1 are on record.
+            for (const Shader::VertexBinding& vs_binding : vertex_shader->vertex_bindings()) {
+              for (const Shader::VertexBinding::Attribute& vs_attr : vs_binding.attributes) {
+                const ParsedVertexFetchInstruction& vs_fetch = vs_attr.fetch_instr;
+                REXGPU_INFO(
+                    "FH1 draw23 vs fetch: swap={} draw#{} fetch_const={} stride_words={} "
+                    "op={} mini={} pred={} fmt={} off={} stride={} exp_adj={} prefetch={} "
+                    "signed_rf={} idx_round={} is_signed={} is_int={} "
+                    "result_target={} result_index={} write_mask={:X}",
+                    presented_output_frames_, composite_draw_logs, vs_binding.fetch_constant,
+                    vs_binding.stride_words,
+                    vs_fetch.opcode_name ? vs_fetch.opcode_name : "(null)",
+                    vs_fetch.is_mini_fetch ? 1 : 0, vs_fetch.is_predicated ? 1 : 0,
+                    uint32_t(vs_fetch.attributes.data_format),
+                    vs_fetch.attributes.offset, vs_fetch.attributes.stride,
+                    vs_fetch.attributes.exp_adjust, vs_fetch.attributes.prefetch_count,
+                    uint32_t(vs_fetch.attributes.signed_rf_mode),
+                    vs_fetch.attributes.is_index_rounded ? 1 : 0,
+                    vs_fetch.attributes.is_signed ? 1 : 0,
+                    vs_fetch.attributes.is_integer ? 1 : 0,
+                    uint32_t(vs_fetch.result.storage_target),
+                    vs_fetch.result.storage_index, vs_fetch.result.original_write_mask);
+              }
+            }
+          }
+          }
+        }
       }
     }
   }
@@ -2767,8 +3415,27 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
 
+  // FH1 footprint-vs probe (draw #23 applied exp-bias): the system-constant
+  // values actually bound for this draw, read after UpdateSystemConstantValues
+  // so the per-draw bias is the applied one, not the previous draw's.
+  if (!g_draw23_vs_applied_done && pixel_shader &&
+      pixel_shader->ucode_data_hash() == 0xA39E23E2FD1F8A8BULL) {
+    REXGPU_INFO(
+        "FH1 draw23 vs applied: swap={} exp_bias={:.6g},{:.6g},{:.6g},{:.6g} "
+        "alpha_ref={:.6g}",
+        presented_output_frames_, system_constants_.color_exp_bias[0],
+        system_constants_.color_exp_bias[1], system_constants_.color_exp_bias[2],
+        system_constants_.color_exp_bias[3], system_constants_.alpha_test_reference);
+    g_draw23_vs_applied_done = true;
+  }
+
   // Vertex buffer residency for in-shader fetch.
   if (!EnsureVertexBufferResidency(vertex_shader->constant_register_map())) {
+    if (trace_tile) {
+      REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_vbuf_residency prim={} mode={} pass={}",
+                  presented_output_frames_, uint32_t(primitive_type),
+                  uint32_t(edram_mode), current_draw_tiling_pass_);
+    }
     ++draw_counters_.dropped_other;
     return false;
   }
@@ -2798,6 +3465,11 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   recording_draw_ = draw_recordable;
   const bool bindings_updated = UpdateBindings(vertex_shader, pixel_shader);
   if (!bindings_updated) {
+    if (trace_tile) {
+      REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_bindings prim={} mode={} pass={}",
+                  presented_output_frames_, uint32_t(primitive_type),
+                  uint32_t(edram_mode), current_draw_tiling_pass_);
+    }
     ++draw_counters_.dropped_bindings;
     return false;
   }
@@ -2892,6 +3564,150 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  // FH1 next-evidence probe (Goal 1): capture a representative 3D draw's
+  // actual pixel-shader output. For the first few draws that write the EDRAM
+  // colour surface (0/32/4x/c3) at/after fh1_debug_edram3d_probe_from, read
+  // that surface twice before the draw (a readback stability control) and
+  // once after it. The before/after pair distinguishes "the shader outputs
+  // grey" from "the draw writes nothing while the surface keeps its clear
+  // value". Purely diagnostic: readbacks + log lines + PPMs only.
+  const std::string edram3d_probe_dir = REXCVAR_GET(fh1_debug_edram3d_probe);
+  bool edram3d_probe_pending = false;
+  bool edram3d_probe_write_files = false;
+  uint32_t edram3d_probe_index = 0;
+  Fh1SurfaceKey edram3d_probe_key;
+  std::vector<uint8_t> edram3d_probe_before;
+  uint32_t edram3d_probe_width = 0;
+  uint32_t edram3d_probe_height = 0;
+  auto edram3d_px = [](const std::vector<uint8_t>& img, uint32_t w, uint32_t h, uint32_t x,
+                       uint32_t y) {
+    if (w == 0 || h == 0 || img.empty()) {
+      return std::string("(?)");
+    }
+    x = std::min(x, w - 1);
+    y = std::min(y, h - 1);
+    const uint8_t* px = img.data() + (size_t(y) * w + x) * 3u;
+    return fmt::format("({},{},{})", px[0], px[1], px[2]);
+  };
+  if (!edram3d_probe_dir.empty() && native_executor_ && native_surfaces_ &&
+      presented_output_frames_ >=
+          uint64_t(std::max<int32_t>(REXCVAR_GET(fh1_debug_edram3d_probe_from), 0))) {
+    static uint32_t edram3d_probe_draws = 0;
+    const int32_t edram3d_budget = REXCVAR_GET(fh1_debug_edram3d_probe_draws);
+    // Phase 2e: EDRAM-only trigger. Keep the Phase 2d slot scan (every bound
+    // render-target slot) and the dropped used_texture_mask gate, but restore
+    // the EDRAM family check (pitch_tiles == 32 && 4x MSAA) so the probe only
+    // fires on the EDRAM surface (0/32/4x/c3) and the budget cannot be spent
+    // on composite/loading draws. The slot index is the pending_key index
+    // (0 = depth, 1..N = colour RTs), so scan 0..kMaxColorRenderTargets to
+    // cover all four colour RTs.
+    const bool edram3d_is_tri =
+        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
+        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip ||
+        primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleFan;
+    if (edram3d_budget > 0 && edram3d_probe_draws < uint32_t(edram3d_budget) && edram3d_is_tri) {
+      const uint32_t edram3d_used_bits = native_executor_->pending_used_bits();
+      Fh1SurfaceKey edram3d_key;
+      D3D11Fh1NativeSurface* edram3d_surface = nullptr;
+      uint32_t edram3d_rt_slot = 0;
+      for (uint32_t rt_slot = 0; rt_slot < 1 + xenos::kMaxColorRenderTargets; ++rt_slot) {
+        if (!(edram3d_used_bits & (1u << rt_slot))) {
+          continue;
+        }
+        const Fh1SurfaceKey candidate_key = native_executor_->pending_key(rt_slot);
+        if (candidate_key.is_depth || candidate_key.base_tiles != 0 ||
+            candidate_key.pitch_tiles != 32 ||
+            candidate_key.msaa != uint32_t(xenos::MsaaSamples::k4X)) {
+          continue;
+        }
+        D3D11Fh1NativeSurface* candidate_surface =
+            native_surfaces_->FindSurface(candidate_key.Pack());
+        if (candidate_surface && candidate_surface->texture) {
+          edram3d_key = candidate_key;
+          edram3d_surface = candidate_surface;
+          edram3d_rt_slot = rt_slot;
+          break;
+        }
+      }
+      if (edram3d_surface) {
+        D3D11_TEXTURE2D_DESC edram3d_desc = {};
+        edram3d_surface->texture->GetDesc(&edram3d_desc);
+        std::vector<uint8_t> edram3d_control;
+        SurfaceDumpStats edram3d_stats_before, edram3d_stats_control;
+        std::string edram3d_error_before, edram3d_error_control;
+        uint32_t edram3d_control_width = 0, edram3d_control_height = 0;
+        ID3D11Device* edram3d_device = GetD3D11Provider().GetDevice();
+        ID3D11DeviceContext* edram3d_context = GetD3D11Provider().GetImmediateContext();
+        const bool edram3d_read_before =
+            ReadSurfaceRgb(edram3d_device, edram3d_context, edram3d_surface,
+                           edram3d_probe_before, edram3d_probe_width, edram3d_probe_height,
+                           edram3d_stats_before, edram3d_error_before);
+        const bool edram3d_read_control =
+            ReadSurfaceRgb(edram3d_device, edram3d_context, edram3d_surface, edram3d_control,
+                           edram3d_control_width, edram3d_control_height,
+                           edram3d_stats_control, edram3d_error_control);
+        if (edram3d_read_before && edram3d_read_control) {
+          const DrawFootprint edram3d_stability = MeasureFootprint(
+              edram3d_probe_before, edram3d_control, edram3d_probe_width, edram3d_probe_height);
+          edram3d_probe_index = ++edram3d_probe_draws;
+          edram3d_probe_key = edram3d_key;
+          edram3d_probe_pending = true;
+          edram3d_probe_write_files = edram3d_probe_index <= 3;
+          const uint64_t edram3d_ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+          REXGPU_INFO(
+              "FH1 edram3d probe control: swap={} probe#{} key={} rt={} texmask={:08X} host={}x{} res_fmt={} "
+              "view_fmt={} samples={} distinct={}/{} control_changed={:.6f} "
+              "control_bbox={},{}-{},{} ps_hash={:016X} verts={}/{} vp={},{} {}x{} "
+              "before_mean={:.6g},{:.6g},{:.6g} px centre={} tl={} tr={} bl={} br={}",
+              presented_output_frames_, edram3d_probe_index, edram3d_key.Describe(),
+              edram3d_rt_slot, used_texture_mask,
+              edram3d_desc.Width, edram3d_desc.Height, uint32_t(edram3d_desc.Format),
+              uint32_t(edram3d_surface->view_format), edram3d_desc.SampleDesc.Count,
+              edram3d_stats_before.distinct, edram3d_stats_control.distinct,
+              edram3d_stability.changed, edram3d_stability.x0, edram3d_stability.y0,
+              edram3d_stability.x1, edram3d_stability.y1, edram3d_ps_hash,
+              primitive_processing_result.guest_draw_vertex_count,
+              primitive_processing_result.host_draw_vertex_count,
+              viewport_info.xy_offset[0], viewport_info.xy_offset[1],
+              viewport_info.xy_extent[0], viewport_info.xy_extent[1],
+              edram3d_stats_before.mean[0], edram3d_stats_before.mean[1],
+              edram3d_stats_before.mean[2],
+              edram3d_px(edram3d_probe_before, edram3d_probe_width, edram3d_probe_height,
+                         edram3d_probe_width / 2, edram3d_probe_height / 2),
+              edram3d_px(edram3d_probe_before, edram3d_probe_width, edram3d_probe_height, 0, 0),
+              edram3d_px(edram3d_probe_before, edram3d_probe_width, edram3d_probe_height,
+                         edram3d_probe_width - 1, 0),
+              edram3d_px(edram3d_probe_before, edram3d_probe_width, edram3d_probe_height, 0,
+                         edram3d_probe_height - 1),
+              edram3d_px(edram3d_probe_before, edram3d_probe_width, edram3d_probe_height,
+                         edram3d_probe_width - 1, edram3d_probe_height - 1));
+          if (edram3d_probe_write_files) {
+            char edram3d_name[255];
+            std::snprintf(edram3d_name, sizeof(edram3d_name), "%s/edram3d-%llu-%u-before.ppm",
+                          edram3d_probe_dir.c_str(),
+                          static_cast<unsigned long long>(presented_output_frames_),
+                          edram3d_probe_index);
+            WriteRgbPpm(edram3d_name, edram3d_probe_before, edram3d_probe_width,
+                        edram3d_probe_height);
+            std::snprintf(edram3d_name, sizeof(edram3d_name), "%s/edram3d-%llu-%u-control.ppm",
+                          edram3d_probe_dir.c_str(),
+                          static_cast<unsigned long long>(presented_output_frames_),
+                          edram3d_probe_index);
+            WriteRgbPpm(edram3d_name, edram3d_control, edram3d_control_width,
+                        edram3d_control_height);
+          }
+        } else {
+          REXGPU_INFO("FH1 edram3d probe: swap={} key={} readback failed ({} / {})",
+                      presented_output_frames_, edram3d_key.Describe(),
+                      edram3d_read_before ? std::to_string(edram3d_stats_before.distinct)
+                                          : edram3d_error_before,
+                      edram3d_read_control ? std::to_string(edram3d_stats_control.distinct)
+                                           : edram3d_error_control);
+        }
+      }
+    }
+  }
+
   // Primitive topology.
   D3D11_PRIMITIVE_TOPOLOGY primitive_topology;
   switch (primitive_processing_result.host_primitive_type) {
@@ -2917,6 +3733,11 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     default:
       REXGPU_ERROR("Host primitive type {} is not supported by the D3D11 command processor",
                    uint32_t(primitive_processing_result.host_primitive_type));
+      if (trace_tile) {
+        REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_host_prim prim={} mode={} pass={}",
+                    presented_output_frames_, uint32_t(primitive_type),
+                    uint32_t(edram_mode), current_draw_tiling_pass_);
+      }
       ++draw_counters_.dropped_other;
       return false;
   }
@@ -2975,10 +3796,20 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       default:
         REXGPU_ERROR("Unhandled index buffer type {}",
                      uint32_t(primitive_processing_result.index_buffer_type));
+        if (trace_tile) {
+          REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_index_buffer prim={} mode={} pass={}",
+                      presented_output_frames_, uint32_t(primitive_type),
+                      uint32_t(edram_mode), current_draw_tiling_pass_);
+        }
         ++draw_counters_.dropped_other;
         return false;
     }
     if (!index_buffer) {
+      if (trace_tile) {
+        REXGPU_INFO("FH1 routing drop: swap={} stage=dropped_index_buffer prim={} mode={} pass={}",
+                    presented_output_frames_, uint32_t(primitive_type),
+                    uint32_t(edram_mode), current_draw_tiling_pass_);
+      }
       ++draw_counters_.dropped_other;
       return false;
     }
@@ -3045,6 +3876,63 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   error_after.c_str());
     }
   }
+  if (edram3d_probe_pending) {
+    if (draw_recorded) {
+      DrainTapeForDiagnostic("edram3d probe");
+    }
+    D3D11Fh1NativeSurface* edram3d_after_surface =
+        native_surfaces_->FindSurface(edram3d_probe_key.Pack());
+    std::vector<uint8_t> edram3d_after_rgb;
+    SurfaceDumpStats edram3d_stats_after;
+    std::string edram3d_error_after;
+    uint32_t edram3d_after_width = 0, edram3d_after_height = 0;
+    if (edram3d_after_surface &&
+        ReadSurfaceRgb(GetD3D11Provider().GetDevice(),
+                       GetD3D11Provider().GetImmediateContext(), edram3d_after_surface,
+                       edram3d_after_rgb, edram3d_after_width, edram3d_after_height,
+                       edram3d_stats_after, edram3d_error_after)) {
+      const DrawFootprint edram3d_footprint = MeasureFootprint(
+          edram3d_probe_before, edram3d_after_rgb, edram3d_probe_width, edram3d_probe_height);
+      REXGPU_INFO(
+          "FH1 edram3d probe draw: swap={} probe#{} key={} vp={},{} {}x{} scissor={},{} "
+          "{}x{} prim={} verts={}/{} changed={:.6f} bbox={},{}-{},{} cols={} rows={} "
+          "after_distinct={} after_mean={:.6g},{:.6g},{:.6g} after={} px centre={} tl={} "
+          "tr={} bl={} br={}",
+          presented_output_frames_, edram3d_probe_index, edram3d_probe_key.Describe(),
+          viewport_info.xy_offset[0], viewport_info.xy_offset[1], viewport_info.xy_extent[0],
+          viewport_info.xy_extent[1], scissor.offset[0], scissor.offset[1], scissor.extent[0],
+          scissor.extent[1], uint32_t(primitive_processing_result.guest_primitive_type),
+          primitive_processing_result.guest_draw_vertex_count,
+          primitive_processing_result.host_draw_vertex_count, edram3d_footprint.changed,
+          edram3d_footprint.x0, edram3d_footprint.y0, edram3d_footprint.x1,
+          edram3d_footprint.y1, edram3d_footprint.columns, edram3d_footprint.rows,
+          edram3d_stats_after.distinct, edram3d_stats_after.mean[0],
+          edram3d_stats_after.mean[1], edram3d_stats_after.mean[2],
+          RgbBandProfile(edram3d_after_rgb, edram3d_after_width, edram3d_after_height),
+          edram3d_px(edram3d_after_rgb, edram3d_after_width, edram3d_after_height,
+                     edram3d_after_width / 2, edram3d_after_height / 2),
+          edram3d_px(edram3d_after_rgb, edram3d_after_width, edram3d_after_height, 0, 0),
+          edram3d_px(edram3d_after_rgb, edram3d_after_width, edram3d_after_height,
+                     edram3d_after_width - 1, 0),
+          edram3d_px(edram3d_after_rgb, edram3d_after_width, edram3d_after_height, 0,
+                     edram3d_after_height - 1),
+          edram3d_px(edram3d_after_rgb, edram3d_after_width, edram3d_after_height,
+                     edram3d_after_width - 1, edram3d_after_height - 1));
+      if (edram3d_probe_write_files) {
+        char edram3d_after_name[255];
+        std::snprintf(edram3d_after_name, sizeof(edram3d_after_name),
+                      "%s/edram3d-%llu-%u-after.ppm", edram3d_probe_dir.c_str(),
+                      static_cast<unsigned long long>(presented_output_frames_),
+                      edram3d_probe_index);
+        WriteRgbPpm(edram3d_after_name, edram3d_after_rgb, edram3d_after_width,
+                    edram3d_after_height);
+      }
+    } else {
+      REXGPU_INFO("FH1 edram3d probe draw: swap={} probe#{} key={} after-readback failed ({})",
+                  presented_output_frames_, edram3d_probe_index, edram3d_probe_key.Describe(),
+                  edram3d_error_after.c_str());
+    }
+  }
   if (dump_c2_after_draw && native_surfaces_) {
     D3D11Fh1NativeSurface* drawn_surface = native_surfaces_->FindSurface(dump_c2_after_key);
     if (drawn_surface) {
@@ -3074,6 +3962,45 @@ bool D3D11CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   PROFILE_DRAW_CALL();
   PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
   ++draw_counters_.issued;
+  // FH1 routing probe (stage D: reached the D3D11 Draw call).
+  if (trace_tile) {
+    REXGPU_INFO("FH1 routing issued: swap={} prim={} mode={} pass={} verts={}/{}",
+                presented_output_frames_, uint32_t(primitive_type), uint32_t(edram_mode),
+                current_draw_tiling_pass_,
+                primitive_processing_result.guest_draw_vertex_count,
+                primitive_processing_result.host_draw_vertex_count);
+  }
+  // FH1 call logger (Phase 2): issued draw (joins to the guest draw by order).
+  // Review additions 7 (design 3.1 / 8.2): the same line also carries
+  // the per-draw state that decides the #23 split — depth/stencil
+  // state (raw dword + decoded enables/funcs from
+  // normalized_depth_control, registers.h:798-818), the full scissor
+  // rect (offset + extent, already scaled by draw_resolution_scale_*),
+  // the claim rect (viewport ∩ scissor), the index count, and the
+  // guest/host vertex counts. The claim rect is the rasterisable
+  // extent given the bound viewport/scissor; the TRUE rasterised
+  // extent is the existing c2-probe footprint (the comparison joins
+  // A3 draw N with the c2-probe bbox for draw N). A true post-VS
+  // screen-space vertex Y-range is NOT computable on the CPU here
+  // (the VS runs on the GPU), so it is deliberately not claimed.
+  if (Fh1CallogEnabled(presented_output_frames_)) {
+    REXGPU_INFO("FH1 callog side=A swap={} kind=issued prim={} mode={} pass={} topo={} "
+                "verts={}/{} idx={} depth={:08X} z={} sten={} zfunc={} stenfunc={} "
+                "scissor={},{},{}x{} claim={},{}-{},{}",
+                presented_output_frames_, uint32_t(primitive_type), uint32_t(edram_mode),
+                current_draw_tiling_pass_, uint32_t(primitive_topology),
+                primitive_processing_result.guest_draw_vertex_count,
+                primitive_processing_result.host_draw_vertex_count,
+                index_count,
+                normalized_depth_control.value,
+                normalized_depth_control.z_enable ? 1 : 0,
+                normalized_depth_control.stencil_enable ? 1 : 0,
+                static_cast<uint32_t>(normalized_depth_control.zfunc),
+                static_cast<uint32_t>(normalized_depth_control.stencilfunc),
+                scissor.offset[0], scissor.offset[1],
+                scissor.extent[0], scissor.extent[1],
+                claim_x0, claim_y0, claim_x1, claim_y1);
+  }
   if (native_executor_) {
     Fh1DrawInfo draw;
     draw.rasterization_done = true;
@@ -3667,6 +4594,25 @@ bool D3D11CommandProcessor::IssueCopy() {
         plan.resolve_key.Describe(), plan.info.IsClearingColor() ? 1 : 0,
         plan.info.IsClearingDepth() ? 1 : 0);
   }
+  // FH1 call logger (Phase 2): resolve/copy plan outcome. Placed here
+  // (right after Fh1PlanResolve, BEFORE the plan-failure early return)
+  // so EVERY copy-mode draw gets an A6 record, including the ones
+  // whose plan fails (copy=0 with the skip reason) — the first version
+  // sat after the early return and missed those (swap-3000: 31
+  // tile-path copies but only 25 A6 lines). The `resolve=` field is
+  // resolve_call_count_, which only increments for successful
+  // resolves, so a failed plan's A6 line shares the previous
+  // successful call's number; failed plans are distinguished by
+  // copy=0 (and by having no resolve-trace line).
+  if (Fh1CallogEnabled(presented_output_frames_)) {
+    REXGPU_INFO(
+        "FH1 callog side=A swap={} kind=copy resolve={} copy={} skip={} pkind={} "
+        "copying_depth={} src={} dest={:08X} dest_extent={:08X}+{}",
+        presented_output_frames_, resolve_call_count_, plan.copy ? 1 : 0,
+        plan.skip ? plan.skip : "none", plan.kind, plan.copying_depth ? 1 : 0,
+        plan.resolve_key.Describe(), plan.dest_base,
+        plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length);
+  }
   if (!resolve_plan_succeeded) {
     if (trace_band2) {
       const RegisterFile& regs = *register_file_;
@@ -4136,6 +5082,80 @@ bool D3D11CommandProcessor::IssueCopy() {
       trace_store_probe && mirror_hash(plan.info.copy_dest_extent_start,
                                        plan.info.copy_dest_extent_length, mirror_before_hash,
                                        mirror_before_nonzero);
+  // FH1 resolve probe (Phase 2f): does the coloured EDRAM content make it
+  // into the resolved texture? For the first few EDRAM (0/32/4x/c3) band-2
+  // resolves at/after fh1_debug_resolve_probe_from, read the mirror at the
+  // resolve destination extent before the resolve, and again after it (below).
+  // The before/after byte-lane means + sample words distinguish "the dispatch
+  // wrote coloured pixels" from "the mirror stayed grey/zero". Purely
+  // diagnostic: readbacks + log lines only.
+  bool resolve_probe_pending = false;
+  uint32_t resolve_probe_index = 0;
+  uint32_t resolve_probe_extent_start = 0;
+  uint32_t resolve_probe_extent_length = 0;
+  uint32_t resolve_probe_dest_base = 0;
+  uint32_t resolve_probe_dest_pitch = 0;
+  uint32_t resolve_probe_dest_info = 0;
+  double resolve_probe_before_mean[4] = {0.0, 0.0, 0.0, 0.0};
+  uint64_t resolve_probe_before_words_nz = 0;
+  uint32_t resolve_probe_before_first = 0;
+  bool resolve_probe_before_ok = false;
+  {
+    const bool resolve_probe_gate =
+        presented_output_frames_ >=
+            uint64_t(std::max<int32_t>(REXCVAR_GET(fh1_debug_resolve_probe_from), 0)) &&
+        !plan.copying_depth && !plan.resolve_key.is_depth &&
+        plan.resolve_key.base_tiles == 0 && plan.resolve_key.pitch_tiles == 32 &&
+        plan.resolve_key.msaa == uint32_t(xenos::MsaaSamples::k4X) && untile_band == 2 &&
+        plan.info.copy_dest_extent_length > 0 &&
+        plan.info.copy_dest_extent_start < SharedMemory::kBufferSize &&
+        plan.info.copy_dest_extent_length <=
+            SharedMemory::kBufferSize - plan.info.copy_dest_extent_start;
+    if (resolve_probe_gate) {
+      static uint32_t resolve_probe_count = 0;
+      const int32_t resolve_probe_budget = REXCVAR_GET(fh1_debug_resolve_probe_draws);
+      if (resolve_probe_budget > 0 && resolve_probe_count < uint32_t(resolve_probe_budget)) {
+        // Read the mirror at the destination extent before the resolve.
+        // (WaitForGpu first: a Map only waits for its own copy, not the
+        // compute work queued before it - same reason as mirror_hash.)
+        if (WaitForGpu()) {
+          resolve_readback_scratch_.resize(plan.info.copy_dest_extent_length);
+          if (upload_sink->ReadbackFromHostBuffer(plan.info.copy_dest_extent_start,
+                                                  resolve_readback_scratch_.data(),
+                                                  plan.info.copy_dest_extent_length)) {
+            const uint8_t* bytes = resolve_readback_scratch_.data();
+            const size_t len = plan.info.copy_dest_extent_length;
+            uint64_t lane_sum[4] = {0, 0, 0, 0};
+            uint64_t lane_count[4] = {0, 0, 0, 0};
+            for (size_t i = 0; i < len; ++i) {
+              lane_sum[i & 3] += bytes[i];
+              ++lane_count[i & 3];
+            }
+            for (int lane = 0; lane < 4; ++lane) {
+              resolve_probe_before_mean[lane] =
+                  lane_count[lane] ? double(lane_sum[lane]) / double(lane_count[lane]) : 0.0;
+            }
+            resolve_probe_before_words_nz = 0;
+            for (size_t i = 0; i + 3 < len; i += 4) {
+              if (*reinterpret_cast<const uint32_t*>(bytes + i)) {
+                ++resolve_probe_before_words_nz;
+              }
+            }
+            resolve_probe_before_first =
+                len >= 4 ? *reinterpret_cast<const uint32_t*>(bytes) : 0;
+            resolve_probe_before_ok = true;
+            resolve_probe_pending = true;
+            resolve_probe_index = ++resolve_probe_count;
+            resolve_probe_extent_start = plan.info.copy_dest_extent_start;
+            resolve_probe_extent_length = plan.info.copy_dest_extent_length;
+            resolve_probe_dest_base = plan.dest_base;
+            resolve_probe_dest_pitch = plan.dest_pitch;
+            resolve_probe_dest_info = plan.dest_info;
+          }
+        }
+      }
+    }
+  }
   const int32_t minimap_swap = REXCVAR_GET(fh1_debug_minimap_capture_swap);
   const bool capture_minimap_frame = minimap_swap > 0 &&
                                      presented_output_frames_ == uint64_t(minimap_swap);
@@ -5251,6 +6271,266 @@ bool D3D11CommandProcessor::IssueCopy() {
         after_hash, after_nonzero, after_ok, after_hash != mirror_before_hash, probe_hash,
         probe_nonzero);
   }
+  // FH1 resolve probe (Phase 2f) - after: read the mirror at the destination
+  // extent and the staging buffer now that the resolve + staging copy have
+  // completed, and log the before/after pixel verdict.
+  if (resolve_probe_pending) {
+    uint64_t resolve_probe_after_words_nz = 0;
+    uint32_t resolve_probe_after_first = 0;
+    double resolve_probe_after_mean[4] = {0.0, 0.0, 0.0, 0.0};
+    bool resolve_probe_after_ok = false;
+    uint64_t resolve_probe_staging_words_nz = 0;
+    uint32_t resolve_probe_staging_first = 0;
+    bool resolve_probe_staging_ok = false;
+    // The mirror is final here: the staging copy ran above and mirror_hash
+    // (store probe) already WaitForGpu'd. Read the mirror extent.
+    if (WaitForGpu()) {
+      resolve_readback_scratch_.resize(resolve_probe_extent_length);
+      if (upload_sink->ReadbackFromHostBuffer(resolve_probe_extent_start,
+                                              resolve_readback_scratch_.data(),
+                                              resolve_probe_extent_length)) {
+        const uint8_t* bytes = resolve_readback_scratch_.data();
+        const size_t len = resolve_probe_extent_length;
+        uint64_t lane_sum[4] = {0, 0, 0, 0};
+        uint64_t lane_count[4] = {0, 0, 0, 0};
+        for (size_t i = 0; i < len; ++i) {
+          lane_sum[i & 3] += bytes[i];
+          ++lane_count[i & 3];
+        }
+        for (int lane = 0; lane < 4; ++lane) {
+          resolve_probe_after_mean[lane] =
+              lane_count[lane] ? double(lane_sum[lane]) / double(lane_count[lane]) : 0.0;
+        }
+        for (size_t i = 0; i + 3 < len; i += 4) {
+          if (*reinterpret_cast<const uint32_t*>(bytes + i)) {
+            ++resolve_probe_after_words_nz;
+          }
+        }
+        resolve_probe_after_first =
+            len >= 4 ? *reinterpret_cast<const uint32_t*>(bytes) : 0;
+        resolve_probe_after_ok = true;
+      }
+      // The staging buffer holds the dispatch's own output, independent of
+      // the copy into the mirror.
+      if (use_staging_copy) {
+        resolve_readback_scratch_.resize(resolve_probe_extent_length);
+        if (upload_sink->ReadbackResolveStaging(0, resolve_readback_scratch_.data(),
+                                                resolve_probe_extent_length)) {
+          const uint8_t* sbytes = resolve_readback_scratch_.data();
+          for (size_t i = 0; i + 3 < resolve_probe_extent_length; i += 4) {
+            if (*reinterpret_cast<const uint32_t*>(sbytes + i)) {
+              ++resolve_probe_staging_words_nz;
+            }
+          }
+          resolve_probe_staging_first = resolve_probe_extent_length >= 4
+                                            ? *reinterpret_cast<const uint32_t*>(sbytes)
+                                            : 0;
+          resolve_probe_staging_ok = true;
+        }
+      }
+    }
+    REXGPU_INFO(
+        "FH1 resolve probe: swap={} probe#{} call={} src={} band={} dest_base={:08X} "
+        "dest_pitch={} extent={:08X}+{} bpp_log2={} staging_ok={} staging_words_nz={} "
+        "staging_first={:08X} mirror_before_ok={} before_mean={:.1f},{:.1f},{:.1f},{:.1f} "
+        "before_words_nz={} before_first={:08X} mirror_after_ok={} after_mean={:.1f},{:.1f},{:.1f},{:.1f} "
+        "after_words_nz={} after_first={:08X}",
+        presented_output_frames_, resolve_probe_index, resolve_call_count_,
+        plan.resolve_key.Describe(), untile_band, resolve_probe_dest_base,
+        resolve_probe_dest_pitch, resolve_probe_extent_start, resolve_probe_extent_length,
+        (resolve_probe_dest_info >> 16u) & 3u, resolve_probe_staging_ok ? 1 : 0,
+        resolve_probe_staging_words_nz, resolve_probe_staging_first,
+        resolve_probe_before_ok ? 1 : 0, resolve_probe_before_mean[0],
+        resolve_probe_before_mean[1], resolve_probe_before_mean[2], resolve_probe_before_mean[3],
+        resolve_probe_before_words_nz, resolve_probe_before_first,
+        resolve_probe_after_ok ? 1 : 0, resolve_probe_after_mean[0], resolve_probe_after_mean[1],
+        resolve_probe_after_mean[2], resolve_probe_after_mean[3], resolve_probe_after_words_nz,
+        resolve_probe_after_first);
+  }
+  // FH1 follow-up probe (Q2): does the resolve source already contain grey,
+  // or does the resolve turn it dark? At resolve time for the scene target
+  // (dest 1C4E1000), read the ACTUAL MSAA source texture as the resolve sees
+  // it (ResolveSubresource to 1x + staging readback, the minimap-source
+  // pattern) and compare its pixel profile for the resolve rect with the
+  // mirror bytes for the same rect. One consistent capture: the source
+  // readback and the mirror hash are taken back-to-back after the dispatch.
+  // Purely diagnostic: readbacks + log lines only.
+  {
+    const int64_t source_probe_from = REXCVAR_GET(fh1_debug_resolve_source_probe_from);
+    static uint32_t source_probe_logs = 0;
+    if (source_probe_from > 0 && presented_output_frames_ == uint64_t(source_probe_from) &&
+        !plan.copying_depth && source.surface && source.surface->texture &&
+        plan.info.copy_dest_extent_start == 0x1C4E1000u && source_probe_logs < 8) {
+      ++source_probe_logs;
+      DrainTapeForDiagnostic("resolve source probe");
+      D3D11_TEXTURE2D_DESC src_desc{};
+      source.surface->texture->GetDesc(&src_desc);
+      D3D11_TEXTURE2D_DESC res_desc = src_desc;
+      res_desc.SampleDesc.Count = 1;
+      res_desc.SampleDesc.Quality = 0;
+      res_desc.Usage = D3D11_USAGE_DEFAULT;
+      res_desc.BindFlags = 0;
+      res_desc.CPUAccessFlags = 0;
+      res_desc.MiscFlags = 0;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved;
+      D3D11_TEXTURE2D_DESC stg_desc = res_desc;
+      stg_desc.Usage = D3D11_USAGE_STAGING;
+      stg_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+      ID3D11Device* probe_device = GetD3D11Provider().GetDevice();
+      ID3D11DeviceContext* probe_context = GetD3D11Provider().GetImmediateContext();
+      const HRESULT cr = probe_device->CreateTexture2D(&res_desc, nullptr, &resolved);
+      const HRESULT cs = probe_device->CreateTexture2D(&stg_desc, nullptr, &staging);
+      auto half_to_float = [](uint16_t h) -> float {
+        const uint32_t s = (uint32_t(h) & 0x8000u) << 16;
+        const uint32_t e = (uint32_t(h) >> 10) & 0x1Fu;
+        const uint32_t m = uint32_t(h) & 0x3FFu;
+        uint32_t bits = 0;
+        if (e == 0) {
+          bits = s;  // Zero (subnormals read as 0: far below the grey tested for).
+        } else if (e == 31) {
+          bits = s | 0x7F800000u | (m << 13);  // Inf/NaN.
+        } else {
+          bits = s | ((e + 112u) << 23) | (m << 13);
+        }
+        float f = 0.0f;
+        std::memcpy(&f, &bits, sizeof(f));
+        return f;
+      };
+      uint64_t src_nz = 0;
+      uint64_t src_total = 0;
+      double src_mean0 = 0.0;
+      float src_min0 = 0.0f;
+      float src_max0 = 0.0f;
+      bool src_have_floats = false;
+      std::string src_samples;
+      bool src_ok = false;
+      if (SUCCEEDED(cr) && SUCCEEDED(cs)) {
+        probe_context->ResolveSubresource(resolved.Get(), 0, source.surface->texture, 0,
+                                          src_desc.Format);
+        probe_context->CopyResource(staging.Get(), resolved.Get());
+        D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
+        Microsoft::WRL::ComPtr<ID3D11Query> query;
+        HRESULT query_result = E_FAIL;
+        if (SUCCEEDED(probe_device->CreateQuery(&query_desc, &query))) {
+          probe_context->End(query.Get());
+          probe_context->Flush();
+          while ((query_result = probe_context->GetData(query.Get(), nullptr, 0, 0)) ==
+                 S_FALSE) {
+            std::this_thread::yield();
+          }
+        }
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT map_result =
+            query_result == S_OK
+                ? probe_context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)
+                : E_FAIL;
+        if (SUCCEEDED(map_result)) {
+          src_ok = true;
+          const uint32_t y0 = std::min<uint32_t>(plan.y0 + source_row_offset, src_desc.Height);
+          const uint32_t y1 = std::min<uint32_t>(plan.y1 + source_row_offset, src_desc.Height);
+          const uint32_t x0 = std::min<uint32_t>(plan.x0, src_desc.Width);
+          const uint32_t x1 = std::min<uint32_t>(plan.x1, src_desc.Width);
+          if (src_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            src_have_floats = true;
+            bool first = true;
+            const uint32_t sample_rows[3] = {y0, (y0 + y1) / 2, y1 ? y1 - 1 : y0};
+            const uint32_t sample_cols[3] = {x0, (x0 + x1) / 2, x1 ? x1 - 1 : x0};
+            for (uint32_t y = y0; y < y1; ++y) {
+              const uint16_t* row = reinterpret_cast<const uint16_t*>(
+                  static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch);
+              for (uint32_t x = x0; x < x1; ++x) {
+                const uint16_t* texel = row + size_t(x) * 4;
+                const float r = half_to_float(texel[0]);
+                if (texel[0] || texel[1] || texel[2] || texel[3]) {
+                  ++src_nz;
+                }
+                ++src_total;
+                src_mean0 += r;
+                if (first || r < src_min0) {
+                  src_min0 = r;
+                }
+                if (first || r > src_max0) {
+                  src_max0 = r;
+                }
+                first = false;
+              }
+            }
+            if (src_total) {
+              src_mean0 /= double(src_total);
+            }
+            for (int s = 0; s < 3; ++s) {
+              const uint16_t* texel = reinterpret_cast<const uint16_t*>(
+                  static_cast<const uint8_t*>(mapped.pData) +
+                  size_t(sample_rows[s]) * mapped.RowPitch) +
+                  size_t(sample_cols[s]) * 4;
+              src_samples += fmt::format(
+                  " ({},{})=({:.6g},{:.6g},{:.6g},{:.6g})", sample_cols[s], sample_rows[s],
+                  half_to_float(texel[0]), half_to_float(texel[1]), half_to_float(texel[2]),
+                  half_to_float(texel[3]));
+            }
+          } else {
+            // Unknown source format: byte-level nonzero only (unmeasured here).
+            src_total = 0;
+            src_nz = 0;
+          }
+          probe_context->Unmap(staging.Get(), 0);
+        }
+      }
+      // Mirror bytes for the same rect: the store probe's hash (sampled 1 in
+      // 16 bytes) plus exact texel stats over the scratch it just filled
+      // (dest is 10:10:10:2, 4 bytes/texel, row stride = dest_pitch).
+      uint64_t mir_hash = 0;
+      uint64_t mir_nz_sampled = 0;
+      const bool mir_ok = mirror_hash(plan.info.copy_dest_extent_start,
+                                      plan.info.copy_dest_extent_length, mir_hash,
+                                      mir_nz_sampled);
+      uint64_t mir_nz = 0;
+      uint64_t mir_total = 0;
+      double mir_mean_r = 0.0;
+      double mir_mean_g = 0.0;
+      double mir_mean_b = 0.0;
+      if (mir_ok && plan.dest_pitch >= 4 && (plan.dest_pitch % 4) == 0 &&
+          (plan.info.copy_dest_extent_length % 4) == 0) {
+        const uint32_t mir_rows =
+            std::min<uint32_t>(plan.y1 - plan.y0,
+                               plan.info.copy_dest_extent_length / plan.dest_pitch);
+        const uint32_t mir_cols =
+            std::min<uint32_t>(plan.x1 - plan.x0, plan.dest_pitch / 4);
+        for (uint32_t y = 0; y < mir_rows; ++y) {
+          const uint32_t* row = reinterpret_cast<const uint32_t*>(
+              resolve_readback_scratch_.data() + size_t(y) * plan.dest_pitch);
+          for (uint32_t x = 0; x < mir_cols; ++x) {
+            const uint32_t w = row[x];
+            if (w != 0) {
+              ++mir_nz;
+            }
+            ++mir_total;
+            mir_mean_r += double(w & 0x3FFu) / 1023.0;
+            mir_mean_g += double((w >> 10) & 0x3FFu) / 1023.0;
+            mir_mean_b += double((w >> 20) & 0x3FFu) / 1023.0;
+          }
+        }
+        if (mir_total) {
+          mir_mean_r /= double(mir_total);
+          mir_mean_g /= double(mir_total);
+          mir_mean_b /= double(mir_total);
+        }
+      }
+      REXGPU_INFO(
+          "FH1 resolve source probe: swap={} call={} dest={:08X}+{} rect={},{}-{},{} "
+          "srcrowoff={} source={} srcfmt={} src={}x{} samples={} | source ok={} floats={} "
+          "nz={}/{} mean0={:.6g} min0={:.6g} max0={:.6g} samples={} | mirror ok={} "
+          "hash={:016X}/{} nz={}/{} meanRGB=({:.6g},{:.6g},{:.6g})",
+          presented_output_frames_, resolve_call_count_, plan.info.copy_dest_extent_start,
+          plan.info.copy_dest_extent_length, plan.x0, plan.y0, plan.x1, plan.y1,
+          source_row_offset, source.surface ? source.surface->key.Describe() : "none",
+          uint32_t(src_desc.Format), src_desc.Width, src_desc.Height,
+          uint32_t(src_desc.SampleDesc.Count), src_ok, src_have_floats ? 1 : 0, src_nz,
+          src_total, src_mean0, src_min0, src_max0, src_samples, mir_ok ? 1 : 0, mir_hash,
+          mir_nz_sampled, mir_nz, mir_total, mir_mean_r, mir_mean_g, mir_mean_b);
+    }
+  }
   const bool resolve_complete = complete;
   if (trace_resolve) {
     trace_resolve_line(fmt::format(
@@ -5663,6 +6943,12 @@ void D3D11CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     }
   }
   ++presented_output_frames_;
+
+  // FH1 call logger (Phase 2): frame boundary (joins to the guest XE_SWAP by swap).
+  if (Fh1CallogEnabled(presented_output_frames_)) {
+    REXGPU_INFO("FH1 callog side=A swap={} kind=present issued={} drawn={}",
+                presented_output_frames_, draw_counters_.issued, draw_counters_.drawn);
+  }
 
   // Frame boundary for the converted index buffer ring.
   if (primitive_processor_) {

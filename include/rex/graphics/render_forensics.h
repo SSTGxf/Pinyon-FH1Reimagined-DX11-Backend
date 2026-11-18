@@ -207,8 +207,12 @@ inline void NoteResolvePlan(uint32_t key, uint8_t failure, const char* skip, int
   if (!detail::WindowActive(s)) return;
   // A planning failure and a legitimate skip are different facts: only a real
   // failure is counted as one. Both keep a stable site id.
-  const bool failed = failure != 0;
-  const uint8_t rf = failed ? RfIdForFailure(failure) : RfIdForSkip(skip);
+  // kEmptyRectangle (4) means there was nothing to copy: an expected
+  // non-transfer, not a failure. Only the other kinds are failures.
+  const bool empty = failure == 4;
+  const bool failed = failure != 0 && !empty;
+  uint8_t rf = failed ? RfIdForFailure(failure) : RfIdForSkip(skip);
+  if (empty) rf = kRfEmptyRectangle;
   if (rf == kRfNone) return;
   ForensicsEvent event;
   event.op = failed ? kOpResolvePlanFail : kOpResolveSkip;
@@ -218,7 +222,11 @@ inline void NoteResolvePlan(uint32_t key, uint8_t failure, const char* skip, int
   event.y0 = y0;
   event.x1 = x1;
   event.y1 = y1;
-  if (skip) std::snprintf(event.note, sizeof(event.note), "%s", skip);
+  if (skip) {
+    std::snprintf(event.note, sizeof(event.note), "%s", skip);
+  } else if (empty) {
+    std::snprintf(event.note, sizeof(event.note), "%s", "empty_rectangle");
+  }
   Emit(event);
 }
 

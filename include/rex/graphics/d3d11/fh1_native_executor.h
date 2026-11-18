@@ -324,6 +324,8 @@ class D3D11Fh1NativeExecutor {
   uint64_t transfer_draws_ = 0;
   uint64_t transfer_copies_ = 0;
   uint64_t transfer_skipped_source_ = 0;
+  // Rectangles past the previous owner: skipped per rectangle, never fatal.
+  uint64_t transfer_rects_outside_source_ = 0;
   uint64_t transfer_skipped_format_ = 0;
   // Depth destinations through the words pass.
   uint64_t transfer_words_dispatches_ = 0;

@@ -300,6 +300,11 @@ TEST_CASE("Arena aligns allocations and rejects overflow", "[d3d11][command-list
   REQUIRE_FALSE(tape.AppendBytes(five, 8, rejected));
   REQUIRE(rejected.empty());
   REQUIRE(tape.overflowed());
+  REQUIRE(tape.overflow_count() == 1);
+
+  D3D11ArenaSpan rejected_again;
+  REQUIRE_FALSE(tape.AppendBytes(five, 8, rejected_again, "TestPacket"));
+  REQUIRE(tape.overflow_count() == 1);
 
   // Out-of-range spans are rejected when resolving, not just when appending.
   REQUIRE(tape.Data(D3D11ArenaSpan{100, 4}) == nullptr);
@@ -308,8 +313,14 @@ TEST_CASE("Arena aligns allocations and rejects overflow", "[d3d11][command-list
 
   tape.Reset();
   REQUIRE_FALSE(tape.overflowed());
+  REQUIRE(tape.overflow_count() == 1);
   REQUIRE(tape.empty());
   REQUIRE(tape.arena_bytes() == 0);
+  D3D11ArenaSpan rejected_after_reset;
+  REQUIRE_FALSE(tape.AppendBytes(five, 41, rejected_after_reset, "TestPacket"));
+  REQUIRE(tape.overflow_count() == 2);
+
+  tape.Reset();
   D3D11ArenaSpan after_reset;
   REQUIRE(tape.AppendBytes(five, sizeof(five), after_reset));
   REQUIRE(after_reset.offset == 0);
@@ -322,10 +333,12 @@ TEST_CASE("Packet cap stops recording and Reset clears it", "[d3d11][command-lis
   REQUIRE(tape.Append<D3D11ClearRenderTargetPacket>() != nullptr);
   REQUIRE(tape.Append<D3D11ClearRenderTargetPacket>() == nullptr);
   REQUIRE(tape.overflowed());
+  REQUIRE(tape.overflow_count() == 1);
   REQUIRE(tape.command_count() == 2);
 
   tape.Reset();
   REQUIRE_FALSE(tape.overflowed());
+  REQUIRE(tape.overflow_count() == 1);
   REQUIRE(tape.command_count() == 0);
   REQUIRE(tape.Append<D3D11ClearRenderTargetPacket>() != nullptr);
 }

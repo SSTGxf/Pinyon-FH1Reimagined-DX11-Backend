@@ -28,6 +28,7 @@
 // Defined in graphics/flags.cpp; declared here only, so the owner census does
 // not force every translation unit that includes flags.h to rebuild.
 REXCVAR_DECLARE(int32_t, fh1_debug_resolve_owner_census);
+REXCVAR_DECLARE(int32_t, fh1_debug_callog);
 
 // The ownership transfer pixel shaders and the fullscreen triangle they draw,
 // compiled for this backend's SM 5.0 profile from the same sources the Direct3D
@@ -121,6 +122,24 @@ namespace {
 // Bytes per EDRAM tile at 32bpp (80 x 16 samples of 4 bytes).
 constexpr uint32_t kEdramTileBytes32bpp =
     xenos::kEdramTileWidthSamples * xenos::kEdramTileHeightSamples * 4;
+
+// Untile bands are 256-row tiles: within the 720-row untile height the band
+// offsets are 0, 256 and 512. untile_bands_ stores one bit per band index
+// (band / kUntileBandRows) for each surface, so a surface remembers every
+// distinct band it was drawn or cleared in instead of only the highest one.
+// The old max(band) record dropped every band below the highest, so those
+// rows were never copied down: band-256 draws happened, but only the band-512
+// copy-down was ever issued (the black middle). Bit 0 is the band at offset 0,
+// which needs no copy-down (Fh1D3D11CopyDownRows returns 0 for it) and is
+// never recorded.
+constexpr uint32_t kUntileBandRows = 256;
+
+// Bit for one untile band in a per-surface band mask. Repeated draws in the
+// same band set the same bit, so each band is copied down exactly once.
+inline uint32_t UntileBandBit(uint32_t band) { return 1u << (band / kUntileBandRows); }
+
+// Row offset of the band stored in one bit of a per-surface band mask.
+inline uint32_t UntileBandFromBit(uint32_t bit) { return bit * kUntileBandRows; }
 
 // Transfer shader variants: the source's data, and what the destination writes.
 // These are the FH1_SOURCE_* / FH1_DEST_KIND defines of fh1_native_transfer.ps.hlsl.
@@ -504,6 +523,82 @@ uint32_t TransferShaderKey(uint32_t source_kind, bool source_msaa, uint32_t dest
                            bool dest_msaa) {
   return (source_kind & 3) | (uint32_t(source_msaa) << 2) | (uint32_t(dest_kind & 3) << 3) |
          (uint32_t(dest_msaa) << 5);
+}
+
+// Diagnostic-only readback for the untile copy-down probe: counts the texels
+// in `rect` of `texture` that hold any nonzero byte. MSAA textures are
+// resolved to a 1x temp first (ResolveSubresource, as DumpSurfacePpm does),
+// because copying an MSAA texture straight into a 1x staging texture does
+// not resolve it and the count would be meaningless. Returns -1 on any
+// failure; it never changes what is drawn, copied, or resolved, and it never
+// fails its caller.
+int64_t CountNonzeroTexelsResolved(ID3D11Device* device, ID3D11DeviceContext* context,
+                                   ID3D11Texture2D* texture, DXGI_FORMAT format,
+                                   const RECT& rect) {
+  const LONG width = rect.right - rect.left, height = rect.bottom - rect.top;
+  if (!device || !context || !texture || width <= 0 || height <= 0 || rect.left < 0 ||
+      rect.top < 0 || format == DXGI_FORMAT_UNKNOWN) {
+    return -1;
+  }
+  D3D11_TEXTURE2D_DESC desc;
+  texture->GetDesc(&desc);
+  if (UINT(rect.left) + UINT(width) > desc.Width ||
+      UINT(rect.top) + UINT(height) > desc.Height) {
+    return -1;
+  }
+  ID3D11Texture2D* source = texture;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> resolved;
+  if (desc.SampleDesc.Count > 1) {
+    D3D11_TEXTURE2D_DESC resolve_desc = desc;
+    resolve_desc.SampleDesc.Count = 1;
+    resolve_desc.SampleDesc.Quality = 0;
+    resolve_desc.Format = format;
+    resolve_desc.BindFlags = 0;
+    resolve_desc.MiscFlags = 0;
+    if (FAILED(device->CreateTexture2D(&resolve_desc, nullptr, &resolved))) {
+      return -1;
+    }
+    context->ResolveSubresource(resolved.Get(), 0, texture, 0, format);
+    source = resolved.Get();
+  }
+  D3D11_TEXTURE2D_DESC staging_desc = desc;
+  staging_desc.Width = UINT(width);
+  staging_desc.Height = UINT(height);
+  staging_desc.Format = format;
+  staging_desc.SampleDesc.Count = 1;
+  staging_desc.SampleDesc.Quality = 0;
+  staging_desc.Usage = D3D11_USAGE_STAGING;
+  staging_desc.BindFlags = 0;
+  staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  staging_desc.MiscFlags = 0;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+  if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, &staging))) {
+    return -1;
+  }
+  const D3D11_BOX box = {UINT(rect.left), UINT(rect.top), 0, UINT(rect.right), UINT(rect.bottom),
+                         1};
+  context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, source, 0, &box);
+  D3D11_MAPPED_SUBRESOURCE mapped;
+  if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    return -1;
+  }
+  // A texel counts when any of its bytes is nonzero, as in CountZeroTexels.
+  const uint32_t bytes_per_pixel = BytesPerPixel(format);
+  const uint32_t row_bytes =
+      std::min<uint32_t>(uint32_t(width) * bytes_per_pixel, mapped.RowPitch);
+  int64_t nonzero_texels = 0;
+  for (LONG y = 0; y < height; ++y) {
+    const uint8_t* row = static_cast<const uint8_t*>(mapped.pData) + size_t(mapped.RowPitch) * y;
+    for (LONG x = 0; x < width && uint32_t(x + 1) * bytes_per_pixel <= row_bytes; ++x) {
+      uint32_t any = 0;
+      for (uint32_t b = 0; b < bytes_per_pixel; ++b) {
+        any |= row[size_t(x) * bytes_per_pixel + b];
+      }
+      nonzero_texels += any != 0;
+    }
+  }
+  context->Unmap(staging.Get(), 0);
+  return nonzero_texels;
 }
 
 }  // namespace
@@ -950,20 +1045,43 @@ bool D3D11Fh1NativeExecutor::TransferRects(const SurfaceKey& dest_key,
     ++transfer_skipped_source_;
     return false;
   }
+  // The rectangles are in the copy's shared pixel space: the same box is used
+  // for the source and the destination, so a rectangle must lie inside both.
+  // A rectangle reaching past the source's extent cannot be copied at all, but
+  // it does not invalidate the rectangles beside it: dropping the whole batch
+  // left the claimant's cleared content in place, which is how a band ends up
+  // black or stale. Such rectangles are filtered out and counted as skips; the
+  // transfer is abandoned only when nothing valid remains.
+  std::vector<RECT> valid_rects;
+  valid_rects.reserve(rect_count);
+  uint32_t skipped_rects = 0;
   for (uint32_t i = 0; i < rect_count; ++i) {
     if (source_row_offset > 0xFFFFu || rects[i].left < 0 || rects[i].top < 0 ||
-        rects[i].right <= rects[i].left ||
-        rects[i].bottom <= rects[i].top || uint32_t(rects[i].right) > dest.width ||
+        rects[i].right <= rects[i].left || rects[i].bottom <= rects[i].top ||
+        uint32_t(rects[i].right) > dest.width ||
         uint32_t(rects[i].bottom) > dest.image_height ||
         source_row_offset > source->image_height ||
         uint32_t(rects[i].bottom) > source->image_height - source_row_offset) {
-      REXGPU_ERROR("D3D11 FH1 native executor: invalid transfer rectangle for {} "
-                   "rect={},{}-{},{} source_row_offset={} source_height={} dest_height={}",
-                   dest_key.Describe(), rects[i].left, rects[i].top, rects[i].right,
-                   rects[i].bottom, source_row_offset, source->image_height, dest.image_height);
-      return false;
+      ++skipped_rects;
+      continue;
     }
+    valid_rects.push_back(rects[i]);
   }
+  if (skipped_rects) {
+    ++transfer_rects_outside_source_;
+    REXGPU_INFO("D3D11 FH1 native executor: transfer clipped for {}: {} of {} rectangles "
+                "lie outside the previous owner's extent (source_row_offset={} source_height={} "
+                "dest_height={}); {} copied",
+                dest_key.Describe(), skipped_rects, rect_count, source_row_offset,
+                source->image_height, dest.image_height, uint32_t(valid_rects.size()));
+  }
+  if (valid_rects.empty()) {
+    // Nothing to inherit: the claimant's own cleared content is correct here.
+    ++transfer_skipped_source_;
+    return false;
+  }
+  rects = valid_rects.data();
+  rect_count = uint32_t(valid_rects.size());
   ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
   if (!context) {
     REXGPU_ERROR("D3D11 FH1 native executor: no immediate context for transfer");
@@ -2558,8 +2676,7 @@ bool D3D11Fh1NativeExecutor::ResolveClear(const Fh1SurfaceKey& key, int32_t x0, 
         (clear_value & 0xFF) != 0 || (surface->stencil_nonzero && !full_surface);
   }
   if (untile_band) {
-    uint32_t& band = untile_bands_[key.Pack()];
-    band = std::max(band, untile_band);
+    untile_bands_[key.Pack()] |= UntileBandBit(untile_band);
   }
   return true;
 }
@@ -2580,14 +2697,18 @@ void D3D11Fh1NativeExecutor::NativeDrawIssued(const Fh1DrawInfo& draw, uint32_t 
     }
     for (uint32_t i = 0; i < std::size(pending_surfaces_); ++i) {
       if (!(pending_used_bits_ & (1u << i)) || !pending_surfaces_[i]) continue;
-      uint32_t& band = untile_bands_[pending_surfaces_[i]->key.Pack()];
-      band = std::max(band, untile_band);
+      untile_bands_[pending_surfaces_[i]->key.Pack()] |= UntileBandBit(untile_band);
     }
   }
 }
 
 bool D3D11Fh1NativeExecutor::EndUntiledTiling() {
   if (!initialized_ || untile_bands_.empty()) return true;
+
+  // Diagnostic-only copy-down probe budget: at most 24 readbacks per process
+  // (8 full source/dest/copyback triples). The probe only ever logs; it never
+  // changes a copy-down's outcome.
+  static int copydown_probe_readbacks = 0;
 
   ID3D11DeviceContext* context = command_processor_.GetD3D11Provider().GetImmediateContext();
   if (!context) {
@@ -2607,7 +2728,7 @@ bool D3D11Fh1NativeExecutor::EndUntiledTiling() {
     context->PSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
     context->CSSetShaderResources(0, UINT(no_srvs.size()), no_srvs.data());
   };
-  for (const auto& [packed, band] : untile_bands_) {
+  for (const auto& [packed, bands] : untile_bands_) {
     D3D11Fh1NativeSurface* surface = config_.surfaces->FindSurface(packed);
     if (!surface || !surface->texture) {
       REXGPU_ERROR("D3D11 FH1 native executor: copy-down surface 0x{:08X} is unavailable",
@@ -2615,58 +2736,134 @@ bool D3D11Fh1NativeExecutor::EndUntiledTiling() {
       succeeded = false;
       continue;
     }
-    const uint32_t copy_rows = Fh1D3D11CopyDownRows(config_.untile_height, band);
-    if (!copy_rows) {
-      completed.push_back(packed);
-      continue;
+    // FH1 call logger (Phase 2, design 8.1): one callog-gated line
+    // per surface per flush carrying the band mask, so the
+    // comparison can account per-band copy-downs including band 0.
+    // Band 0 is expected-zero by design (never recorded: the
+    // record sites guard on untile_band != 0, and
+    // CopyDownRows(720, 0) = 0), so a mask with bit 0 clear is
+    // correct, not a missing copy-down. Gated on the callog swap
+    // only (no budget charge: at most one line per surface, only
+    // at one swap).
+    {
+      const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+      if (callog_swap > 0 &&
+          command_processor_.presented_output_frames() == uint64_t(callog_swap)) {
+        REXGPU_INFO("FH1 callog side=A swap={} kind=untileflush key={} bands={:08X}",
+                    command_processor_.presented_output_frames(), surface->key.Describe(),
+                    bands);
+      }
     }
-    if (band > surface->image_height || copy_rows > surface->image_height - band) {
-      REXGPU_ERROR("D3D11 FH1 native executor: copy-down rows {}..{} exceed {} (key={})",
-                   band, band + copy_rows, surface->image_height, surface->key.Describe());
-      succeeded = false;
-      continue;
-    }
-    if (!config_.surfaces->EnsureCopyDownSurface(*surface)) {
-      succeeded = false;
-      continue;
-    }
+    // One copy-down per distinct band the surface was drawn in, lowest band
+    // first. The band mask deduplicates repeated draws in the same band, so
+    // each band is copied down exactly once. Bands run in ascending order so
+    // the last copy-down is the highest band, leaving its rows at EDRAM row 0
+    // for the resolve that follows the flush - the same state the old
+    // single-band copy-down produced.
+    bool surface_done = true;
+    for (uint32_t bit = 0; bands >> bit; ++bit) {
+      if (!(bands & (1u << bit))) continue;
+      const uint32_t band = UntileBandFromBit(bit);
+      const uint32_t copy_rows = Fh1D3D11CopyDownRows(config_.untile_height, band);
+      if (!copy_rows) {
+        continue;
+      }
+      if (band > surface->image_height || copy_rows > surface->image_height - band) {
+        REXGPU_ERROR("D3D11 FH1 native executor: copy-down rows {}..{} exceed {} (key={})",
+                     band, band + copy_rows, surface->image_height, surface->key.Describe());
+        succeeded = false;
+        surface_done = false;
+        break;
+      }
+      if (!config_.surfaces->EnsureCopyDownSurface(*surface)) {
+        succeeded = false;
+        surface_done = false;
+        break;
+      }
 
-    ID3D11RenderTargetView* no_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-    context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
-    unbind_srvs();
-    context->CopyResource(surface->copy_down_texture, surface->texture);
-    context->OMSetBlendState(nullptr, nullptr,
-                             Fh1D3D11SampleMask(surface->key, surface->samples));
+      // Diagnostic-only copy-down probe (no rendering change): at the traced
+      // swap, read back the source rows, the transfer destination, and the
+      // copy-back result, so a black middle can be localized to the source,
+      // the transfer, or the resolve downstream. A failed readback logs
+      // nonzero=-1 and never affects the copy-down.
+      const int32_t trace_swap = REXCVAR_GET(fh1_debug_tile_trace_swap);
+      const bool probe = trace_swap > 0 &&
+                         command_processor_.presented_output_frames() == uint64_t(trace_swap);
+      ID3D11Device* probe_device =
+          probe ? command_processor_.GetD3D11Provider().GetDevice() : nullptr;
+      DXGI_FORMAT probe_format = surface->view_format;
+      if (probe && probe_format == DXGI_FORMAT_UNKNOWN) {
+        D3D11_TEXTURE2D_DESC probe_desc;
+        surface->texture->GetDesc(&probe_desc);
+        probe_format = probe_desc.Format;
+      }
+      auto probe_stage = [&](const char* stage, ID3D11Texture2D* probe_texture,
+                             const RECT& probe_rect, uint32_t row_begin, uint32_t row_end) {
+        if (!probe || copydown_probe_readbacks >= 24) return;
+        ++copydown_probe_readbacks;
+        const uint64_t total = uint64_t(probe_rect.right - probe_rect.left) *
+                               uint64_t(probe_rect.bottom - probe_rect.top);
+        const int64_t nonzero = CountNonzeroTexelsResolved(probe_device, context, probe_texture,
+                                                           probe_format, probe_rect);
+        REXGPU_INFO("FH1 copydown probe: swap={} key={} band={} stage={} rows={}..{} nonzero={}/{} fmt={} samples={}",
+                    command_processor_.presented_output_frames(), surface->key.Describe(), band,
+                    stage, row_begin, row_end, nonzero, total, uint32_t(probe_format),
+                    surface->samples);
+      };
 
-    D3D11Fh1NativeSurface copy_down = *surface;
-    copy_down.texture = surface->copy_down_texture;
-    copy_down.rtv = surface->copy_down_rtv;
-    copy_down.uint_rtv = surface->copy_down_uint_rtv;
-    copy_down.dsv = surface->copy_down_dsv;
-    const RECT rect = {0, 0, LONG(surface->width), LONG(copy_rows)};
-    TileGeometry geometry;
-    if (!GetTileGeometry(*surface, geometry)) {
-      REXGPU_ERROR("D3D11 FH1 native executor: copy-down geometry unavailable for {}",
-                   surface->key.Describe());
-      succeeded = false;
-      continue;
-    }
-    const uint32_t tile_rows = (copy_rows + geometry.pixel_height - 1) / geometry.pixel_height;
-    const uint32_t tile_count = geometry.columns * tile_rows;
-    if (!TransferRects(surface->key, copy_down, packed, &rect, 1, tile_count,
-                       surface->stencil_nonzero, band)) {
-      succeeded = false;
-      continue;
-    }
+      ID3D11RenderTargetView* no_targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+      context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
+      unbind_srvs();
+      context->CopyResource(surface->copy_down_texture, surface->texture);
+      {
+        const RECT source_rect = {0, LONG(band), LONG(surface->width),
+                                  LONG(band + copy_rows)};
+        probe_stage("source", surface->texture, source_rect, band, band + copy_rows);
+      }
+      context->OMSetBlendState(nullptr, nullptr,
+                               Fh1D3D11SampleMask(surface->key, surface->samples));
 
-    unbind_srvs();
-    ID3D11UnorderedAccessView* no_uav = nullptr;
-    context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
-    context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
-    context->CopyResource(surface->texture, surface->copy_down_texture);
-    completed.push_back(packed);
-    REXGPU_INFO("D3D11 FH1 untile copy-down: key={} band={} rows=0..{} samples={}",
-                surface->key.Describe(), band, copy_rows, surface->samples);
+      D3D11Fh1NativeSurface copy_down = *surface;
+      copy_down.texture = surface->copy_down_texture;
+      copy_down.rtv = surface->copy_down_rtv;
+      copy_down.uint_rtv = surface->copy_down_uint_rtv;
+      copy_down.dsv = surface->copy_down_dsv;
+      const RECT rect = {0, 0, LONG(surface->width), LONG(copy_rows)};
+      TileGeometry geometry;
+      if (!GetTileGeometry(*surface, geometry)) {
+        REXGPU_ERROR("D3D11 FH1 native executor: copy-down geometry unavailable for {}",
+                     surface->key.Describe());
+        succeeded = false;
+        surface_done = false;
+        break;
+      }
+      const uint32_t tile_rows = (copy_rows + geometry.pixel_height - 1) / geometry.pixel_height;
+      const uint32_t tile_count = geometry.columns * tile_rows;
+      if (!TransferRects(surface->key, copy_down, packed, &rect, 1, tile_count,
+                         surface->stencil_nonzero, band)) {
+        succeeded = false;
+        surface_done = false;
+        break;
+      }
+
+      {
+        const RECT dest_rect = {0, 0, LONG(surface->width), LONG(copy_rows)};
+        probe_stage("dest", surface->copy_down_texture, dest_rect, 0, copy_rows);
+      }
+
+      unbind_srvs();
+      ID3D11UnorderedAccessView* no_uav = nullptr;
+      context->CSSetUnorderedAccessViews(0, 1, &no_uav, nullptr);
+      context->OMSetRenderTargets(UINT(std::size(no_targets)), no_targets, nullptr);
+      context->CopyResource(surface->texture, surface->copy_down_texture);
+      {
+        const RECT copyback_rect = {0, 0, LONG(surface->width), LONG(copy_rows)};
+        probe_stage("copyback", surface->texture, copyback_rect, 0, copy_rows);
+      }
+      REXGPU_INFO("D3D11 FH1 untile copy-down: key={} band={} rows=0..{} samples={}",
+                  surface->key.Describe(), band, copy_rows, surface->samples);
+    }
+    if (surface_done) completed.push_back(packed);
   }
   for (uint32_t packed : completed) untile_bands_.erase(packed);
   return succeeded;

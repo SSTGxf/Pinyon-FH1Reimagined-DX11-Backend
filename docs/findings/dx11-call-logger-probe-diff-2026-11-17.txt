@@ -1,0 +1,411 @@
+=== src/graphics/flags.cpp ===
+25a26,30
+> REXCVAR_DEFINE_INT32(fh1_debug_callog, 0, "GPU",
+>                      "Log FH1 guest-call / D3D11-call comparison lines (FH1 callog) for this "
+>                      "presented frame; 0 disables");
+> REXCVAR_DEFINE_INT32(fh1_debug_callog_budget, 8192, "GPU",
+>                      "Maximum FH1 callog lines per process; 0 disables the budget cap");
+
+=== include/rex/graphics/flags.h ===
+66a67,68
+> REXCVAR_DECLARE(int32_t, fh1_debug_callog);
+> REXCVAR_DECLARE(int32_t, fh1_debug_callog_budget);
+
+=== src/graphics/command_processor.cpp (shared) ===
+2222a2223,2267
+> // FH1 call logger (Phase 2): gate + budget for the "FH1 callog" lines.
+> // (Same contract as the D3D11 backend's copy; the two files do not share
+> // a translation unit, so each keeps its own counter.)
+> static uint32_t g_callog_lines_used = 0;
+> static bool g_callog_budget_exhausted_logged = false;
+> static bool Fh1CallogEnabled(uint64_t swap) {
+>   const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+>   if (callog_swap <= 0 || swap != uint64_t(callog_swap)) {
+>     return false;
+>   }
+>   const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);
+>   if (budget > 0 && g_callog_lines_used >= uint32_t(budget)) {
+>     if (!g_callog_budget_exhausted_logged) {
+>       g_callog_budget_exhausted_logged = true;
+>       REXGPU_INFO("FH1 callog budget exhausted swap={} budget={}", swap, budget);
+>     }
+>     return false;
+>   }
+>   ++g_callog_lines_used;
+>   return true;
+> }
+> 
+> // Type-3-specific sequence number for the packet census (review
+> // correction 5). Incremented once per Type-3 packet, regardless of
+> // the callog gate, so the logged t3seq values must be consecutive
+> // within a swap; counter_ cannot be used (it advances for Type-0/1/2
+> // packets too, so gaps in it are expected).
+> static uint64_t g_callog_t3seq = 0;
+> 
+> // Draw-relevant Type-0 registers for the callog reg filter (design 1.3,
+> // corrected per review: per REGISTER, not per packet range).
+> static bool Fh1CallogRegIsRelevant(uint32_t index) {
+>   return index == XE_GPU_REG_RB_COLOR_INFO ||
+>          index == XE_GPU_REG_RB_DEPTH_INFO ||
+>          index == XE_GPU_REG_RB_MODECONTROL ||
+>          index == XE_GPU_REG_RB_SURFACE_INFO ||
+>          index == XE_GPU_REG_PA_SC_WINDOW_OFFSET ||
+>          index == XE_GPU_REG_PA_SC_VIZ_QUERY ||
+>          index == XE_GPU_REG_SQ_VS_CONST || index == XE_GPU_REG_SQ_PS_CONST ||
+>          (index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+>           index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+>          (index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+>           index <= XE_GPU_REG_SHADER_CONSTANT_511_W);
+> }
+> 
+2239a2285,2302
+>   // FH1 call logger (Phase 2): log the index + value of every
+>   // draw-relevant register in the written range, reading the values
+>   // back from the register file after the write (design 1.3).
+>   auto callog_reg_write = [&]() {
+>     if (!Fh1CallogEnabled(trace_swaps_)) return;
+>     // write_one_reg packets write count values to the single register
+>     // base_index (the read-back is the final value); range packets
+>     // write one value per register starting at base_index.
+>     const uint32_t reg_count = write_one_reg ? 1 : count;
+>     for (uint32_t i = 0; i < reg_count; ++i) {
+>       const uint32_t idx = base_index + i;
+>       if (!Fh1CallogRegIsRelevant(idx)) continue;
+>       REXGPU_INFO(
+>           "FH1 callog side=G swap={} kind=reg base={:04X} count={} idx={:04X} "
+>           "val={:08X}",
+>           trace_swaps_, base_index, count, idx, register_file_->values[idx]);
+>     }
+>   };
+2248a2312
+>     callog_reg_write();
+2254a2319
+>   callog_reg_write();
+2281a2347,2348
+>   // FH1 call logger (Phase 2): Type-3 sequence number (review correction 5).
+>   ++g_callog_t3seq;
+2411a2479,2486
+>   // FH1 call logger (Phase 2): one line per Type-3 packet (packet census).
+>   if (Fh1CallogEnabled(trace_swaps_)) {
+>     REXGPU_INFO(
+>         "FH1 callog side=G swap={} kind=pkt op={:02X} t3seq={} pred={} out={} "
+>         "sel={:016X} mask={:016X} pass={}",
+>         trace_swaps_, opcode, g_callog_t3seq, packet & 1, predicated_out ? 1 : 0,
+>         bin_select_, bin_mask_, TilingPassOfSelect());
+>   }
+2600a2676,2686
+>   // FH1 call logger (Phase 2): resulting bin state after the handler,
+>   // for the SET_BIN_* commands that change the state the pkt line logs
+>   // (review correction 2). PM4_SET_BIN_SELECT has no handler, so it
+>   // has no pktpost line.
+>   if ((opcode == PM4_SET_BIN_MASK_LO || opcode == PM4_SET_BIN_MASK_HI ||
+>        opcode == PM4_SET_BIN_SELECT_LO || opcode == PM4_SET_BIN_SELECT_HI ||
+>        opcode == PM4_SET_BIN_MASK) &&
+>       Fh1CallogEnabled(trace_swaps_)) {
+>     REXGPU_INFO("FH1 callog side=G swap={} kind=pktpost op={:02X} sel={:016X} mask={:016X}",
+>                 trace_swaps_, opcode, bin_select_, bin_mask_);
+>   }
+3901a3988,3994
+>   // FH1 call logger (Phase 2): shader load (guest address + dword count).
+>   if (Fh1CallogEnabled(trace_swaps_)) {
+>     REXGPU_INFO("FH1 callog side=G swap={} kind=shaderload src=load type={} addr={:08X} "
+>                 "dwords={}",
+>                 trace_swaps_,
+>                 shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", addr, size_dwords);
+>   }
+4003a4097,4103
+>   }
+>   // FH1 call logger (Phase 2): inline shader load (ucode embedded in packet).
+>   if (Fh1CallogEnabled(trace_swaps_)) {
+>     REXGPU_INFO("FH1 callog side=G swap={} kind=shaderload src=imm type={} addr={:08X} "
+>                 "dwords={}",
+>                 trace_swaps_,
+>                 shader_type == xenos::ShaderType::kVertex ? "vs" : "ps", 0, size_dwords);
+
+=== src/graphics/d3d11/command_processor.cpp ===
+56a57,58
+> REXCVAR_DECLARE(int32_t, fh1_debug_callog);
+> REXCVAR_DECLARE(int32_t, fh1_debug_callog_budget);
+86a89,110
+> // FH1 call logger (Phase 2): gate + budget for the "FH1 callog" lines.
+> // Returns true once per line actually emitted; false when the logger is
+> // off, the swap does not match, or the line budget is exhausted.
+> uint32_t g_callog_lines_used = 0;
+> bool g_callog_budget_exhausted_logged = false;
+> bool Fh1CallogEnabled(uint64_t swap) {
+>   const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+>   if (callog_swap <= 0 || swap != uint64_t(callog_swap)) {
+>     return false;
+>   }
+>   const int32_t budget = REXCVAR_GET(fh1_debug_callog_budget);
+>   if (budget > 0 && g_callog_lines_used >= uint32_t(budget)) {
+>     if (!g_callog_budget_exhausted_logged) {
+>       g_callog_budget_exhausted_logged = true;
+>       REXGPU_INFO("FH1 callog budget exhausted swap={} budget={}", swap, budget);
+>     }
+>     return false;
+>   }
+>   ++g_callog_lines_used;
+>   return true;
+> }
+> 
+897a922,928
+>     // FH1 call logger (Phase 2): texture-fetch constant write (single).
+>     if (Fh1CallogEnabled(presented_output_frames_)) {
+>       const uint32_t fetch_index =
+>           (index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6;
+>       REXGPU_INFO("FH1 callog side=G swap={} kind=texfetch first={} last={}",
+>                   presented_output_frames_, fetch_index, fetch_index);
+>     }
+996a1028,1032
+>     // FH1 call logger (Phase 2): texture-fetch constant write (range).
+>     if (Fh1CallogEnabled(presented_output_frames_)) {
+>       REXGPU_INFO("FH1 callog side=G swap={} kind=texfetch first={} last={}",
+>                   presented_output_frames_, first_fetch_dword / 6, last_fetch_dword / 6);
+>     }
+2057a2094,2109
+>   // FH1 call logger (Phase 2): shader translation outcome (joins to the
+>   // guest shader load by vs/ps hash).
+>   if (Fh1CallogEnabled(presented_output_frames_)) {
+>     REXGPU_INFO(
+>         "FH1 callog side=A swap={} kind=shader vs={:016X} ps={:016X} vvalid={} "
+>         "pvalid={} pipeline={:016X}",
+>         presented_output_frames_,
+>         vertex_shader ? vertex_shader->ucode_data_hash() : 0,
+>         pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+>         vertex_shader_translation->is_valid() ? 1 : 0,
+>         pixel_shader_translation
+>             ? (pixel_shader_translation->is_valid() ? 1 : 0)
+>             : -1,
+>         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pipeline)));
+>   }
+> 
+3884a3937,3944
+>   // FH1 call logger (Phase 2): issued draw (joins to the guest draw by order).
+>   if (Fh1CallogEnabled(presented_output_frames_)) {
+>     REXGPU_INFO("FH1 callog side=A swap={} kind=issued prim={} mode={} pass={} topo={} "
+>                 "verts={}",
+>                 presented_output_frames_, uint32_t(primitive_type), uint32_t(edram_mode),
+>                 current_draw_tiling_pass_, uint32_t(primitive_topology),
+>                 primitive_processing_result.host_draw_vertex_count);
+>   }
+4568a4629,4638
+>   // FH1 call logger (Phase 2): resolve/copy plan outcome.
+>   if (Fh1CallogEnabled(presented_output_frames_)) {
+>     REXGPU_INFO(
+>         "FH1 callog side=A swap={} kind=copy resolve={} copy={} skip={} pkind={} "
+>         "copying_depth={} src={} dest={:08X} dest_extent={:08X}+{}",
+>         presented_output_frames_, resolve_call_count_, plan.copy ? 1 : 0,
+>         plan.skip ? plan.skip : "none", plan.kind, plan.copying_depth ? 1 : 0,
+>         plan.resolve_key.Describe(), plan.dest_base,
+>         plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length);
+>   }
+6657a6728,6733
+> 
+>   // FH1 call logger (Phase 2): frame boundary (joins to the guest XE_SWAP by swap).
+>   if (Fh1CallogEnabled(presented_output_frames_)) {
+>     REXGPU_INFO("FH1 callog side=A swap={} kind=present issued={} drawn={}",
+>                 presented_output_frames_, draw_counters_.issued, draw_counters_.drawn);
+>   }
+
+=== src/graphics/d3d11/texture_cache.cpp ===
+1100a1101,1103
+>       // FH1 call logger (Phase 2, review correction 4): one-shot flag for
+>       // the budget-exhausted record below.
+>       static bool bind_all_exhausted_logged = false;
+1129,1131c1132,1135
+<       if (std::find(bind_all_seen.begin(), bind_all_seen.end(), all_key) ==
+<               bind_all_seen.end() &&
+<           bind_all_logs < 400) {
+---
+>       const bool bind_all_new =
+>           std::find(bind_all_seen.begin(), bind_all_seen.end(), all_key) ==
+>           bind_all_seen.end();
+>       if (bind_all_new && bind_all_logs < 400) {
+1147a1152,1160
+>       } else if (bind_all_new) {
+>         // A distinct binding arrived after the 400-log cap: record once
+>         // so the comparison can tell incomplete evidence from a genuine
+>         // missing bind (review correction 4).
+>         if (!bind_all_exhausted_logged) {
+>           bind_all_exhausted_logged = true;
+>           REXGPU_INFO("FH1 srv bind all budget exhausted swap={} distinct={}",
+>                       command_processor_.presented_output_frames(), bind_all_logs);
+>         }
+
+==================================================================
+SECOND BUILD (2026-11-17) — revisions from the first census run
+Diff: pre-second-build (.musebak-callog2-20261117, first-build probes)
+  vs post-second-build (current scratch / live PC).
+  shared CP:    7e99b0f6 -> bcaa2533
+  D3D11 CP:     89f3556d -> 67ec36ff
+  executor:     47b792f0 -> 8babe8e2
+Changes: (1) G3 budget-per-line + decode_regs read-back;
+  (2) A3 depth/stencil + scissor + claim + idx + gverts, remove
+  (void)index_count; (3) untileflush line + DECLARE in executor.
+==================================================================
+
+--- src/graphics/command_processor.cpp (shared)
+2287a2288,2297
+>   // Budget is charged per EMITTED line (design 5.3): the first
+>   // version charged once per packet, so a 10-register packet
+>   // emitted 10 lines for 1 unit of budget and the cap was
+>   // meaningless (80,403 reg lines flowed against an 8192 budget
+>   // in the first run). The read-back is from decode_regs(), not
+>   // register_file_: the routing-guest line reads decode_regs(),
+>   // and when record_split_ is active the two files diverge
+>   // (writes land in the decode file first). When record_split_
+>   // is off, decode_regs() IS register_file_, so this changes
+>   // nothing in that case.
+2289d2298
+<     if (!Fh1CallogEnabled(trace_swaps_)) return;
+2296a2306
+>       if (!Fh1CallogEnabled(trace_swaps_)) return;
+2300c2310
+<           trace_swaps_, base_index, count, idx, register_file_->values[idx]);
+---
+>           trace_swaps_, base_index, count, idx, decode_regs().values[idx]);
+
+--- src/graphics/d3d11/command_processor.cpp
+1784d1783
+<   (void)index_count;
+3937a3937,3948
+>   // Review additions 7 (design 3.1 / 8.2): the same line also carries
+>   // the per-draw state that decides the #23 split — depth/stencil
+>   // state (raw dword + decoded enables/funcs from
+>   // normalized_depth_control, registers.h:798-818), the full scissor
+>   // rect (offset + extent, already scaled by draw_resolution_scale_*),
+>   // the claim rect (viewport ∩ scissor), the index count, and the
+>   // guest/host vertex counts. The claim rect is the rasterisable
+>   // extent given the bound viewport/scissor; the TRUE rasterised
+>   // extent is the existing c2-probe footprint (the comparison joins
+>   // A3 draw N with the c2-probe bbox for draw N). A true post-VS
+>   // screen-space vertex Y-range is NOT computable on the CPU here
+>   // (the VS runs on the GPU), so it is deliberately not claimed.
+3940c3951,3952
+<                 "verts={}",
+---
+>                 "verts={}/{} idx={} depth={:08X} z={} sten={} zfunc={} stenfunc={} "
+>                 "scissor={},{},{}x{} claim={},{}-{},{}",
+3943c3955,3965
+<                 primitive_processing_result.host_draw_vertex_count);
+---
+>                 primitive_processing_result.guest_draw_vertex_count,
+>                 primitive_processing_result.host_draw_vertex_count,
+>                 index_count,
+>                 normalized_depth_control.value,
+>                 normalized_depth_control.z_enable ? 1 : 0,
+>                 normalized_depth_control.stencil_enable ? 1 : 0,
+>                 static_cast<uint32_t>(normalized_depth_control.zfunc),
+>                 static_cast<uint32_t>(normalized_depth_control.stencilfunc),
+>                 scissor.offset[0], scissor.offset[1],
+>                 scissor.extent[0], scissor.extent[1],
+>                 claim_x0, claim_y0, claim_x1, claim_y1);
+
+--- src/graphics/d3d11/fh1_native_executor.cpp
+30a31
+> REXCVAR_DECLARE(int32_t, fh1_debug_callog);
+2736a2738,2755
+>     }
+>     // FH1 call logger (Phase 2, design 8.1): one callog-gated line
+>     // per surface per flush carrying the band mask, so the
+>     // comparison can account per-band copy-downs including band 0.
+>     // Band 0 is expected-zero by design (never recorded: the
+>     // record sites guard on untile_band != 0, and
+>     // CopyDownRows(720, 0) = 0), so a mask with bit 0 clear is
+>     // correct, not a missing copy-down. Gated on the callog swap
+>     // only (no budget charge: at most one line per surface, only
+>     // at one swap).
+>     {
+>       const int32_t callog_swap = REXCVAR_GET(fh1_debug_callog);
+>       if (callog_swap > 0 &&
+>           command_processor_.presented_output_frames() == uint64_t(callog_swap)) {
+>         REXGPU_INFO("FH1 callog side=A swap={} kind=untileflush key={} bands={:08X}",
+>                     command_processor_.presented_output_frames(), surface->key.Describe(),
+>                     bands);
+>       }
+
+================================================================================
+THIRD BUILD (2026-11-17, after the swap-3000 comparison run 3) — A6 move
+================================================================================
+File: src/graphics/d3d11/command_processor.cpp (CRLF)
+Script: ~/workspace/dx11-call-logger-scratch/apply-d3d11-3.py
+Backup on PC: command_processor.cpp.musebak-callog3-20261117 (374,012 B)
+Live hash after deploy: 1502de6f715c54c7d7bc401afcda1cd846136be5e0c3006bc0c6b0c6fa82c5f5
+Build: BUILD_EXIT=0, EXE 11/17/2026 2:32:42 AM PC, DLL 2:32:38 AM PC,
+  11,496,960 B. All 9 DLL markers present.
+
+PROBLEM (swap-3000 run 3, thread t6756): tile-path counted 31 copy-mode
+draws but only 25 A6 (kind=copy) lines fired. The A6 block sat AFTER the
+plan-failure early return (`if (!resolve_plan_succeeded) return
+plan.empty;` — "Nothing to copy or clear: Xenos does no work either"), so
+copy-mode draws whose resolve plan fails never reached it. All 25 A6 lines
+had copy=1 and consecutive resolve numbers (41854-41878, no gaps), so the
+6 missing ones are the plan-failure copies.
+
+FIX: move the A6 block to just after Fh1PlanResolve (and the forensics /
+band-trace logging), BEFORE the `if (!resolve_plan_succeeded)` check.
+Now every IssueCopy call emits exactly one A6 line:
+  - successful plan: copy=1 (as before)
+  - failed plan: copy=0 with the skip reason (new evidence; plan.kind is
+    empty for a failed plan, so its A6 line reads "pkind= " — the
+    comparison's A6 regex was fixed to pkind=\S* to parse it)
+Note: the `resolve=` field is resolve_call_count_, which only increments
+for successful resolves (at the end of IssueCopy), so a failed plan's A6
+line shares the previous successful call's resolve number. Failed plans
+are distinguished by copy=0 (and by having no resolve-trace line); the
+comparison counts A6 lines, not resolve numbers, so this is not a false
+join.
+
+Diff (before = command_processor.cpp.musebak-callog3-20261117, after = live):
+4559a4560,4578
+>   // FH1 call logger (Phase 2): resolve/copy plan outcome. Placed here
+>   // (right after Fh1PlanResolve, BEFORE the plan-failure early return)
+>   // so EVERY copy-mode draw gets an A6 record, including the ones
+>   // whose plan fails (copy=0 with the skip reason) — the first version
+>   // sat after the early return and missed those (swap-3000: 31
+>   // tile-path copies but only 25 A6 lines). The `resolve=` field is
+>   // resolve_call_count_, which only increments for successful
+>   // resolves, so a failed plan's A6 line shares the previous
+>   // successful call's number; failed plans are distinguished by
+>   // copy=0 (and by having no resolve-trace line).
+>   if (Fh1CallogEnabled(presented_output_frames_)) {
+>     REXGPU_INFO(
+>         "FH1 callog side=A swap={} kind=copy resolve={} copy={} skip={} pkind={} "
+>         "copying_depth={} src={} dest={:08X} dest_extent={:08X}+{}",
+>         presented_output_frames_, resolve_call_count_, plan.copy ? 1 : 0,
+>         plan.skip ? plan.skip : "none", plan.kind, plan.copying_depth ? 1 : 0,
+>         plan.resolve_key.Describe(), plan.dest_base,
+>         plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length);
+>   }
+4650,4659d4668
+<   }
+<   // FH1 call logger (Phase 2): resolve/copy plan outcome.
+<   if (Fh1CallogEnabled(presented_output_frames_)) {
+<     REXGPU_INFO(
+<         "FH1 callog side=A swap={} kind=copy resolve={} copy={} skip={} pkind={} "
+<         "copying_depth={} src={} dest={:08X} dest_extent={:08X}+{}",
+<         presented_output_frames_, resolve_call_count_, plan.copy ? 1 : 0,
+<         plan.skip ? plan.skip : "none", plan.kind, plan.copying_depth ? 1 : 0,
+<         plan.resolve_key.Describe(), plan.dest_base,
+<         plan.info.copy_dest_extent_start, plan.info.copy_dest_extent_length);
+
+================================================================================
+COMPARISON-SCRIPT FIXES (same session, no PC change) — compare.py
+================================================================================
+1. A6 regex: pkind \S+ -> \S* (a failed plan's A6 line has an empty
+   plan.kind, so "pkind= " did not match and the 6 copy=0 lines were
+   silently dropped — run 4 first counted 25, not 31).
+2. A1 census: the three independent draw counts (BINPRED / routing-guest /
+   draw packets) must AGREE with each other — that is the logger gate.
+   The 129 baseline is a REFERENCE; a difference is a frame-content
+   finding, not a logger failure. Same for the outcome rollup: the gate
+   is unaccounted == 0; issued/copy/drops differences vs baseline are
+   findings.
+3. B3: exclude the single-point no_guest_visible_output baseline pattern
+   (prim==1, idx==1) from the band-0-culling flag; report it separately.
+4. B4: classify scissors (full-frame / HALF-SCREEN split-relevant /
+   EDRAM-height / small target / other) instead of flagging every
+   non-full-frame scissor; only half-screen (1280x360) scissors are
+   #23-split mechanism-4 candidates.
+5. A1 rollup now prints the A6 copy=1 / copy=0 split.

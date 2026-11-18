@@ -23,6 +23,15 @@ REXCVAR_DEFINE_BOOL(fh1_debug_disable_msaa, false, "GPU",
 REXCVAR_DEFINE_INT32(fh1_debug_tile_trace_swap, 338, "GPU",
                      "Log D3D11 FH1 draw tile window/viewport/scissor state and 4x source row "
                      "hashes before resolves on this presented frame; 0 disables");
+REXCVAR_DEFINE_INT32(fh1_debug_callog, 0, "GPU",
+                     "Log FH1 guest-call / D3D11-call comparison lines (FH1 callog) for this "
+                     "presented frame; 0 disables");
+REXCVAR_DEFINE_INT32(fh1_debug_callog_budget, 8192, "GPU",
+                     "Maximum FH1 callog lines per process; 0 disables the budget cap");
+REXCVAR_DEFINE_INT32(fh1_debug_trace_span, 1, "GPU",
+                     "Number of consecutive presented frames to log FH1 callog / "
+                     "routing lines for, starting at fh1_debug_callog / "
+                     "fh1_debug_tile_trace_swap; 1 = single swap (unchanged behavior)");
 REXCVAR_DEFINE_INT32(fh1_debug_band2_trace_swap, 0, "GPU",
                      "Trace FH1 Band 2 packets and draw processing for this PM4 XE_SWAP frame; "
                      "0 disables");
@@ -30,6 +39,10 @@ REXCVAR_DEFINE_INT32(fh1_debug_band_suppress, 0, "GPU",
                      "Diagnostic draw suppression mask: bit 0 suppresses pass 0 (bin select 3), "
                      "bit 1 pass 1 (0xC), bit 2 pass 2 (0x30); copy/resolve/clear packets are "
                      "not suppressed; 0 disables");
+REXCVAR_DEFINE_BOOL(fh1_debug_hide_hud, false, "GPU",
+                    "Diagnostic: skip HUD/2D overlay draws (small-viewport color draws) "
+                    "while keeping 3D world draws; false disables")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(fh1_debug_minimap_capture_swap, 338, "GPU",
                      "Capture one 320x192 FH1 minimap candidate at source, resolved guest bytes, "
                      "and sampled texture stages on this presented frame; 0 disables");
@@ -327,6 +340,48 @@ REXCVAR_DEFINE_INT32(fh1_debug_c2_probe_from, 0, "GPU",
 REXCVAR_DEFINE_INT32(fh1_debug_c2_probe_draws, 24, "GPU",
                      "Diagnostic: how many draws fh1_debug_c2_probe reads back (two reads "
                      "before, one after), each of them a full surface readback")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(fh1_debug_edram3d_probe, "", "GPU",
+                      "Diagnostic: name an existing directory; for each of the first "
+                      "fh1_debug_edram3d_probe_draws draws that write the EDRAM colour "
+                      "surface (0/32/4x/c3) at or after fh1_debug_edram3d_probe_from, read "
+                      "that surface twice before the draw (a readback stability control "
+                      "that must report 0), then once after it, and log the pixels the draw "
+                      "itself changed - the share, the bounding box, and the change per "
+                      "64-pixel column and 60-pixel row - next to the draw's viewport, "
+                      "scissor and surface descriptor. The first three probed draws are "
+                      "also written as before/control/after PPMs")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_edram3d_probe_from, 1500, "GPU",
+                     "Diagnostic: the presented-frame index at which fh1_debug_edram3d_probe "
+                     "starts probing draws (0 = from the first frame)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_edram3d_probe_draws, 3, "GPU",
+                     "Diagnostic: how many draws fh1_debug_edram3d_probe reads back (two reads "
+                     "before, one after), each of them a full surface readback")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_resolve_probe_from, 3000, "GPU",
+                     "Diagnostic: the presented-frame index at which fh1_debug_resolve_probe "
+                     "starts probing EDRAM band-2 resolves (0 = from the first frame)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_resolve_probe_draws, 12, "GPU",
+                     "Diagnostic: how many EDRAM band-2 resolves fh1_debug_resolve_probe reads "
+                     "back (mirror before/after + staging), each a full extent readback")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_srv_bind_all_from, 0, "GPU",
+                     "Diagnostic: at this presented-frame index, log the bind result of "
+                     "every texture fetch (any size) in GetActiveTextureBindfulSRV, "
+                     "deduplicated per distinct fetch/binding outcome, up to 400 lines - "
+                     "the 3D draws' sub-frame fetches, which the frame-sized srv-bind log "
+                     "never sees (0 = off)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(fh1_debug_resolve_source_probe_from, 0, "GPU",
+                     "Diagnostic: at this presented-frame index, for each resolve whose "
+                     "destination extent starts at the FH1 scene target (1C4E1000), read "
+                     "the MSAA resolve-source texture as the resolve sees it "
+                     "(ResolveSubresource to 1x + staging readback) and compare its pixel "
+                     "profile with the mirror bytes the resolve just wrote for the same "
+                     "rect, up to 8 probes (0 = off)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(fh1_debug_post_clip, 0, "GPU",
                      "Diagnostic: with fh1_debug_vertex_dump, log the post pass's own vertices "

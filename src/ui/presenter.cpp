@@ -1017,6 +1017,21 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   // larger than that as they include the overscan area that will be outside the
   // screen. Make sure the intermediate images can't be larger than the maximum
   // render target size.
+  // Temporary: the inputs that decide where the guest image lands in the host
+  // render target, so a misplaced or undersized rect can be traced to them.
+  {
+    static std::atomic<uint32_t> logged_flow = 0;
+    const uint32_t flow_index = ++logged_flow;
+    if (flow_index <= 6 || !(flow_index % 300)) {
+      REXLOG_INFO(
+          "Presenter flow: surface={}x{} host={}x{} max={}x{} aspect={}:{} active={} "
+          "output=({},{}) {}x{}",
+          surface_width_in_paint_connection_, surface_height_in_paint_connection_,
+          host_rt_width, host_rt_height, max_rt_width, max_rt_height,
+          properties.display_aspect_ratio_x, properties.display_aspect_ratio_y,
+          properties.IsActive(), flow.output_x, flow.output_y, output_width, output_height);
+    }
+  }
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 

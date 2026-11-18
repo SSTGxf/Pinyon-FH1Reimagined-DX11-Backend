@@ -1,0 +1,314 @@
+157a158,169
+> # Dispatch is the third routing stage (guest -> record -> dispatch), logged
+> # by the SHARED command processor, so it fires on BOTH backends. On D11 it
+> # is followed by issue/issued/bound (D11-executor code); on Vulkan it is
+> # the LAST routing stage the logs show, so in Vulkan mode it is the
+> # outcome event (the draw reached the dispatch stage). Added 2026-11-17
+> # (Phase 2b) — the D11 run never needed it because issue/issued existed.
+> # NOTE: the dispatch line carries NO idx (unlike guest/record/issue), so
+> # the guest-vs-dispatch order join compares (prim, mode, pass) only.
+> RE_ROUTING_DISPATCH = re.compile(
+>     r"FH1 routing dispatch: swap=(?P<swap>\d+) prim=(?P<prim>\d+) "
+>     r"mode=(?P<mode>\d+) pass=(?P<pass>-?\d+) sel=(?P<sel>[0-9A-Fa-f]{16}) "
+>     r"mask=(?P<mask>[0-9A-Fa-f]{16})")
+258c270
+<         "rbound": [], "rdrop": [], "rissued": [], "tilepath": [], "tiledraw": [],
+---
+>         "rdispatch": [], "rbound": [], "rdrop": [], "rissued": [], "tilepath": [], "tiledraw": [],
+367a380,387
+>                 m = RE_ROUTING_DISPATCH.search(line)
+>                 if m and int(m.group("swap")) == swap:
+>                     d = {"prim": int(m.group("prim")),
+>                          "mode": int(m.group("mode")), "pass": int(m.group("pass")),
+>                          "sel": int(m.group("sel"), 16),
+>                          "mask": int(m.group("mask"), 16)}
+>                     out["rdispatch"].append(d)
+>                     continue
+576a597,607
+>     # Phase 2b (2026-11-17): --backend vulkan re-targets the acceptance
+>     # criteria to what the Vulkan executor actually emits. The shared
+>     # command processor (guest/record/dispatch, callog pkt/reg) fires on
+>     # both backends; the D11-only record types (routing issue/issued/bound,
+>     # A9 present, A4 ConfigurePipeline, srv-bind, resolve trace, tile-path
+>     # copy/untileflush) do NOT fire on Vulkan, so in Vulkan mode their
+>     # absence is reported as "not emitted" instead of failing the census.
+>     # The D11 mode is unchanged (Phase 2's PASS still reproduces).
+>     ap.add_argument("--backend", type=str, default="d11",
+>                     choices=("d11", "vulkan"),
+>                     help="backend that produced the logs (default: d11)")
+578a610,611
+>     backend = args.backend
+>     vulkan = backend == "vulkan"
+585a619,624
+>     elif vulkan:
+>         # No A9 lines exist on Vulkan (the presenter record is D11-only),
+>         # so thread auto-detection cannot work — the caller must pass it.
+>         print("FAIL: --backend vulkan needs an explicit --thread (no A9 present "
+>               "lines exist on Vulkan to auto-detect the run's thread).")
+>         return 1
+603c642
+<     print(f"FH1 call-logger comparison — swap {swap}, thread t{thread}")
+---
+>     print(f"FH1 call-logger comparison — swap {swap}, thread t{thread}, backend {backend}")
+604a644,647
+>     if vulkan:
+>         print("NOTE: Vulkan mode — D11-only record types (routing issue/issued/bound, "
+>               "A9 present, A4 shader, srv-bind, resolve trace) are not emitted by "
+>               "the Vulkan executor; their absence is reported, not flagged.")
+636,639c679,686
+<     print(f"[A1] draw census: BINPRED={n_binpred} routing-guest={n_rguest} "
+<           f"routing-record={n_rrecord} routing-issue={n_rissue} (baseline {BASE_DRAWS})")
+<     # Logger gate: the three independent counts must AGREE with each other
+<     # (BINPRED == routing-guest == draw packets). The 129 baseline is a
+---
+>     n_rdispatch = len(data["rdispatch"])
+>     n_binpred_out = sum(1 for b in data["binpred"] if b["out"])
+>     n_binpred_in = n_binpred - n_binpred_out
+>     print(f"[A1] draw census: BINPRED={n_binpred} (in={n_binpred_in} out={n_binpred_out}) "
+>           f"routing-guest={n_rguest} routing-record={n_rrecord} "
+>           f"routing-dispatch={n_rdispatch} routing-issue={n_rissue} (baseline {BASE_DRAWS})")
+>     # Logger gate: the independent counts must AGREE with each other.
+>     # D11: BINPRED == routing-guest == draw packets (the 129 baseline is a
+645c692,722
+<     if n_binpred != n_rguest or n_rguest != draws_pkt:
+---
+>     # Vulkan: BINPRED counts every DRAW_INDX packet the bin stage saw,
+>     # including ones the predication culls by bin mask (a draw whose mask
+>     # does not overlap the current bin select is correctly skipped for
+>     # this band — banded tiling working as designed, not a drop). So the
+>     # agreement is BINPRED-total == draw packets AND BINPRED-in ==
+>     # routing-guest == routing-record == routing-dispatch. The culled
+>     # count is reported with its mask breakdown, not flagged.
+>     if vulkan:
+>         if n_binpred != draws_pkt or n_binpred_in != n_rguest or \
+>                 n_rguest != n_rrecord or n_rrecord != n_rdispatch:
+>             print(f"  FAIL: independent draw counts disagree (BINPRED {n_binpred} "
+>                   f"/ in {n_binpred_in} / guest {n_rguest} / record {n_rrecord} "
+>                   f"/ dispatch {n_rdispatch} / draw packets {draws_pkt})")
+>             flags.append(("MISTRANSLATED",
+>                           f"draw counts disagree: BINPRED {n_binpred} / in "
+>                           f"{n_binpred_in} / guest {n_rguest} / record "
+>                           f"{n_rrecord} / dispatch {n_rdispatch} / packets "
+>                           f"{draws_pkt}"))
+>             ok = False
+>         else:
+>             print(f"  PASS: independent draw counts agree ({n_rguest} accepted; "
+>                   f"{n_binpred_out} mask-culled before ExecuteDrawRecord)")
+>         if n_binpred_out:
+>             culled_masks = Counter(f"{b['mask']:016X}" for b in data["binpred"] if b["out"])
+>             in_masks = Counter(f"{b['mask']:016X}" for b in data["binpred"] if not b["out"])
+>             print(f"  culled (out=true) by bin mask: {dict(culled_masks)}")
+>             print(f"  accepted (out=false) by bin mask: {dict(in_masks)}")
+>             findings.append(f"{n_binpred_out} DRAW_INDX predicated out by bin mask "
+>                             f"(culled masks {dict(culled_masks)}) — banded-tiling "
+>                             f"culling, not a drop")
+>     elif n_binpred != n_rguest or n_rguest != draws_pkt:
+664c741
+<     elif n_binpred != n_rguest:
+---
+>     elif not vulkan and n_binpred != n_rguest:
+667c744,748
+<     if n_rissue != n_rguest:
+---
+>     if vulkan:
+>         print(f"  NOTE: routing-issue ({n_rissue}) is a D11-executor record — "
+>               f"not emitted on Vulkan; dispatch ({n_rdispatch}) is the last "
+>               f"routing stage on this backend")
+>     elif n_rissue != n_rguest:
+699c780,781
+<     # estimate when BINPRED was logged in this run.
+---
+>     # estimate when BINPRED was logged in this run. On Vulkan the culled
+>     # draws are the bin-mask culls (see the A1 census above), not failures.
+707,717c789,805
+<     unaccounted = n_rguest - n_issued - n_copy_tp - n_drop
+<     print(f"  unaccounted guest draws: {unaccounted} "
+<           f"(guest draws with no outcome event in log order)")
+<     # Logger gate: unaccounted must be 0 (every guest draw has an outcome).
+<     # The issued/copy/drops counts are compared to the baseline as a
+<     # reference; a difference is a frame-content finding, not a logger
+<     # failure (the guest issued a different draw stream in this frame).
+<     if unaccounted != 0:
+<         print("  FAIL: unaccounted guest draws != 0")
+<         flags.append(("DROPPED", f"{unaccounted} guest draws with no outcome"))
+<         ok = False
+---
+>     if vulkan:
+>         # Vulkan outcome: the draw reached the dispatch stage (the last
+>         # routing stage the Vulkan executor logs). There is no stage-D
+>         # issued/copy/drop record on this backend, so the D11 baseline
+>         # comparison and the callog cross-checks do not apply here.
+>         unaccounted = n_rguest - n_rdispatch
+>         print(f"  Vulkan outcome: dispatched={n_rdispatch} "
+>               f"(guest draws reaching the dispatch stage)")
+>         print(f"  unaccounted guest draws: {unaccounted} "
+>               f"(guest draws with no dispatch event in log order)")
+>         if unaccounted != 0:
+>             print("  FAIL: unaccounted guest draws != 0")
+>             flags.append(("DROPPED", f"{unaccounted} guest draws with no outcome"))
+>             ok = False
+>         else:
+>             print("  PASS: every guest draw accounted for (unaccounted=0)")
+>         print()
+719,744c807,844
+<         print("  PASS: every guest draw accounted for (unaccounted=0)")
+<     if (n_issued != BASE_ISSUED or n_copy_tp != BASE_COPY or
+<             drop_counts.get("no_guest_visible_output", 0) != BASE_NO_VISIBLE):
+<         print(f"  NOTE: outcome rollup differs from the baseline "
+<               f"(issued {n_issued} vs {BASE_ISSUED}, copy {n_copy_tp} vs "
+<               f"{BASE_COPY}, no_guest_visible_output "
+<               f"{drop_counts.get('no_guest_visible_output', 0)} vs "
+<               f"{BASE_NO_VISIBLE}) — frame-content difference, see the "
+<               f"draw-count finding above")
+<         findings.append(f"outcome rollup {n_issued}/{n_copy_tp}/"
+<                         f"{drop_counts.get('no_guest_visible_output', 0)} vs "
+<                         f"baseline {BASE_ISSUED}/{BASE_COPY}/{BASE_NO_VISIBLE} "
+<                         f"(frame-content difference)")
+<     else:
+<         print("  PASS: outcome rollup matches the routing baseline")
+<     if n_a_issued != n_issued:
+<         print(f"  FAIL: callog-issued ({n_a_issued}) != stage-D issued ({n_issued})")
+<         flags.append(("MISTRANSLATED",
+<                       f"callog-issued {n_a_issued} != stage-D {n_issued}"))
+<         ok = False
+<     if n_a_copy != n_copy_tp:
+<         print(f"  FAIL: callog-copy ({n_a_copy}) != tile-path copy ({n_copy_tp})")
+<         flags.append(("MISTRANSLATED",
+<                       f"callog-copy {n_a_copy} != tile-path copy {n_copy_tp}"))
+<         ok = False
+<     print()
+---
+>         unaccounted = n_rguest - n_issued - n_copy_tp - n_drop
+>         print(f"  unaccounted guest draws: {unaccounted} "
+>               f"(guest draws with no outcome event in log order)")
+>         # Logger gate: unaccounted must be 0 (every guest draw has an outcome).
+>         # The issued/copy/drops counts are compared to the baseline as a
+>         # reference; a difference is a frame-content finding, not a logger
+>         # failure (the guest issued a different draw stream in this frame).
+>         if unaccounted != 0:
+>             print("  FAIL: unaccounted guest draws != 0")
+>             flags.append(("DROPPED", f"{unaccounted} guest draws with no outcome"))
+>             ok = False
+>         else:
+>             print("  PASS: every guest draw accounted for (unaccounted=0)")
+>         if (n_issued != BASE_ISSUED or n_copy_tp != BASE_COPY or
+>                 drop_counts.get("no_guest_visible_output", 0) != BASE_NO_VISIBLE):
+>             print(f"  NOTE: outcome rollup differs from the baseline "
+>                   f"(issued {n_issued} vs {BASE_ISSUED}, copy {n_copy_tp} vs "
+>                   f"{BASE_COPY}, no_guest_visible_output "
+>                   f"{drop_counts.get('no_guest_visible_output', 0)} vs "
+>                   f"{BASE_NO_VISIBLE}) — frame-content difference, see the "
+>                   f"draw-count finding above")
+>             findings.append(f"outcome rollup {n_issued}/{n_copy_tp}/"
+>                             f"{drop_counts.get('no_guest_visible_output', 0)} vs "
+>                             f"baseline {BASE_ISSUED}/{BASE_COPY}/{BASE_NO_VISIBLE} "
+>                             f"(frame-content difference)")
+>         else:
+>             print("  PASS: outcome rollup matches the routing baseline")
+>         if n_a_issued != n_issued:
+>             print(f"  FAIL: callog-issued ({n_a_issued}) != stage-D issued ({n_issued})")
+>             flags.append(("MISTRANSLATED",
+>                           f"callog-issued {n_a_issued} != stage-D {n_issued}"))
+>             ok = False
+>         if n_a_copy != n_copy_tp:
+>             print(f"  FAIL: callog-copy ({n_a_copy}) != tile-path copy ({n_copy_tp})")
+>             flags.append(("MISTRANSLATED",
+>                           f"callog-copy {n_a_copy} != tile-path copy {n_copy_tp}"))
+>             ok = False
+>         print()
+759c859
+<     if n_pred_out:
+---
+>     if n_pred_out and not vulkan:
+761a862,866
+>     elif n_pred_out and vulkan:
+>         # Mask-culled by the bin predication (see the A1 census) — banded
+>         # tiling working as designed, not a drop. Already reported above.
+>         print("  (Vulkan: these are the bin-mask culls from the A1 census — "
+>               "expected for a single-band present, not flagged)")
+766a872,877
+>     # Order join: D11 joins guest vs issue (the D11-executor stage); Vulkan
+>     # has no issue lines, so it joins guest vs dispatch (the last stage
+>     # both backends log). The dispatch line carries no idx, so the Vulkan
+>     # join compares (prim, mode, pass) only; the D11 join also checks idx.
+>     join_other = data["rdispatch"] if vulkan else data["rissue"]
+>     join_name = "dispatch" if vulkan else "issue"
+768,770c879,884
+<     for i, (g, a) in enumerate(zip(data["rguest"], data["rissue"])):
+<         if (g["prim"], g["idx"], g["mode"], g["pass"]) != \
+<            (a["prim"], a["idx"], a["mode"], a["pass"]):
+---
+>     for i, (g, a) in enumerate(zip(data["rguest"], join_other)):
+>         g_key = (g["prim"], g["mode"], g["pass"]) if vulkan else \
+>             (g["prim"], g["idx"], g["mode"], g["pass"])
+>         a_key = (a["prim"], a["mode"], a["pass"]) if vulkan else \
+>             (a["prim"], a["idx"], a["mode"], a["pass"])
+>         if g_key != a_key:
+773,775c887,889
+<                 print(f"  JOIN MISMATCH draw {i}: guest {(g['prim'], g['idx'], g['mode'], g['pass'])} "
+<                       f"vs issue {(a['prim'], a['idx'], a['mode'], a['pass'])}")
+<     print(f"  order join mismatches (guest vs issue): {join_bad}")
+---
+>                 print(f"  JOIN MISMATCH draw {i}: guest {g_key} "
+>                       f"vs {join_name} {a_key}")
+>     print(f"  order join mismatches (guest vs {join_name}): {join_bad}")
+777c891
+<         flags.append(("MISTRANSLATED", f"{join_bad} guest/issue order-join mismatches"))
+---
+>         flags.append(("MISTRANSLATED", f"{join_bad} guest/{join_name} order-join mismatches"))
+905,909c1019,1030
+<     uncovered = issued_hashes - a_hashes
+<     print(f"  distinct (vs,ps) in routing-issue: {len(issued_hashes)}; "
+<           f"in A4: {len(a_hashes)}; issue-hashes not in A4: {len(uncovered)}")
+<     if uncovered:
+<         findings.append(f"{len(uncovered)} routing-issue (vs,ps) hashes not in any A4 line")
+---
+>     if vulkan:
+>         # No A4 lines and no routing-issue lines exist on Vulkan (both are
+>         # D11-executor records). The shaderload lines above are the Vulkan
+>         # shader evidence; the A4 coverage check does not apply here.
+>         print("  (Vulkan: A4 ConfigurePipeline lines are D11-only; no coverage "
+>               "check — shaderload lines above are the shader evidence)")
+>     else:
+>         uncovered = issued_hashes - a_hashes
+>         print(f"  distinct (vs,ps) in routing-issue: {len(issued_hashes)}; "
+>               f"in A4: {len(a_hashes)}; issue-hashes not in A4: {len(uncovered)}")
+>         if uncovered:
+>             findings.append(f"{len(uncovered)} routing-issue (vs,ps) hashes not in any A4 line")
+914a1036,1045
+>     # F4 closeout fix (2026-11-17): pvalid==-1 (pixel shader unbound at
+>     # ConfigurePipeline — the mode-5 depth-only draws) used to slip through
+>     # this check, which only flagged vvalid==0 or pvalid==0. Count it
+>     # separately: it is expected for depth-only draws, so it is a finding,
+>     # not a failure.
+>     n_ps_unbound = sum(1 for a in data["a_shader"] if a["pvalid"] == -1)
+>     print(f"  A4 lines with pvalid==-1 (ps unbound, depth-only): {n_ps_unbound}")
+>     if n_ps_unbound:
+>         findings.append(f"{n_ps_unbound} A4 lines with pvalid==-1 (ps unbound at "
+>                         f"ConfigurePipeline — consistent with depth-only draws)")
+928,930c1059,1068
+<         print("  FAIL: no A9 present line for the swap")
+<         flags.append(("SPURIOUS", "no A9 present line"))
+<         ok = False
+---
+>         if vulkan:
+>             # No A9 present line exists on Vulkan (the presenter record is
+>             # D11-only). The frame boundary here is the callog swap gate
+>             # itself, not an A9 line — not a failure.
+>             print("  (Vulkan: no A9 present line — the presenter record is "
+>                   "D11-only; the frame boundary is the callog swap gate)")
+>         else:
+>             print("  FAIL: no A9 present line for the swap")
+>             flags.append(("SPURIOUS", "no A9 present line"))
+>             ok = False
+1130a1269,1278
+>     if vulkan:
+>         # No bound keys exist on Vulkan (rbound is D11-only). The guest
+>         # surface keys (surf from the routing-guest lines) are the Vulkan
+>         # equivalent: the render target the guest selected for each draw.
+>         guest_surfs = Counter(g["surf"] for g in data["rguest"])
+>         print(f"Guest draws by surf key (Vulkan; bound keys are D11-only):")
+>         for surf, n in guest_surfs.most_common(10):
+>             print(f"  surf={surf:08X}: {n}")
+>         guest_c0d0 = Counter((g["c0"], g["d0"]) for g in data["rguest"])
+>         print(f"Guest draws by (c0, d0) base: {dict(guest_c0d0)}")

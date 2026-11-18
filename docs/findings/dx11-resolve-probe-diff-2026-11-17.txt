@@ -1,0 +1,183 @@
+--- /tmp/d3d11_cp_orig.cpp	2026-11-17 23:39:48.010817479 +0000
++++ /tmp/d3d11_command_processor.cpp	2026-11-17 23:39:29.671817621 +0000
+@@ -5082,6 +5082,80 @@
+       trace_store_probe && mirror_hash(plan.info.copy_dest_extent_start,
+                                        plan.info.copy_dest_extent_length, mirror_before_hash,
+                                        mirror_before_nonzero);
++  // FH1 resolve probe (Phase 2f): does the coloured EDRAM content make it
++  // into the resolved texture? For the first few EDRAM (0/32/4x/c3) band-2
++  // resolves at/after fh1_debug_resolve_probe_from, read the mirror at the
++  // resolve destination extent before the resolve, and again after it (below).
++  // The before/after byte-lane means + sample words distinguish "the dispatch
++  // wrote coloured pixels" from "the mirror stayed grey/zero". Purely
++  // diagnostic: readbacks + log lines only.
++  bool resolve_probe_pending = false;
++  uint32_t resolve_probe_index = 0;
++  uint32_t resolve_probe_extent_start = 0;
++  uint32_t resolve_probe_extent_length = 0;
++  uint32_t resolve_probe_dest_base = 0;
++  uint32_t resolve_probe_dest_pitch = 0;
++  uint32_t resolve_probe_dest_info = 0;
++  double resolve_probe_before_mean[4] = {0.0, 0.0, 0.0, 0.0};
++  uint64_t resolve_probe_before_words_nz = 0;
++  uint32_t resolve_probe_before_first = 0;
++  bool resolve_probe_before_ok = false;
++  {
++    const bool resolve_probe_gate =
++        presented_output_frames_ >=
++            uint64_t(std::max<int32_t>(REXCVAR_GET(fh1_debug_resolve_probe_from), 0)) &&
++        !plan.copying_depth && !plan.resolve_key.is_depth &&
++        plan.resolve_key.base_tiles == 0 && plan.resolve_key.pitch_tiles == 32 &&
++        plan.resolve_key.msaa == uint32_t(xenos::MsaaSamples::k4X) && untile_band == 2 &&
++        plan.info.copy_dest_extent_length > 0 &&
++        plan.info.copy_dest_extent_start < SharedMemory::kBufferSize &&
++        plan.info.copy_dest_extent_length <=
++            SharedMemory::kBufferSize - plan.info.copy_dest_extent_start;
++    if (resolve_probe_gate) {
++      static uint32_t resolve_probe_count = 0;
++      const int32_t resolve_probe_budget = REXCVAR_GET(fh1_debug_resolve_probe_draws);
++      if (resolve_probe_budget > 0 && resolve_probe_count < uint32_t(resolve_probe_budget)) {
++        // Read the mirror at the destination extent before the resolve.
++        // (WaitForGpu first: a Map only waits for its own copy, not the
++        // compute work queued before it - same reason as mirror_hash.)
++        if (WaitForGpu()) {
++          resolve_readback_scratch_.resize(plan.info.copy_dest_extent_length);
++          if (upload_sink->ReadbackFromHostBuffer(plan.info.copy_dest_extent_start,
++                                                  resolve_readback_scratch_.data(),
++                                                  plan.info.copy_dest_extent_length)) {
++            const uint8_t* bytes = resolve_readback_scratch_.data();
++            const size_t len = plan.info.copy_dest_extent_length;
++            uint64_t lane_sum[4] = {0, 0, 0, 0};
++            uint64_t lane_count[4] = {0, 0, 0, 0};
++            for (size_t i = 0; i < len; ++i) {
++              lane_sum[i & 3] += bytes[i];
++              ++lane_count[i & 3];
++            }
++            for (int lane = 0; lane < 4; ++lane) {
++              resolve_probe_before_mean[lane] =
++                  lane_count[lane] ? double(lane_sum[lane]) / double(lane_count[lane]) : 0.0;
++            }
++            resolve_probe_before_words_nz = 0;
++            for (size_t i = 0; i + 3 < len; i += 4) {
++              if (*reinterpret_cast<const uint32_t*>(bytes + i)) {
++                ++resolve_probe_before_words_nz;
++              }
++            }
++            resolve_probe_before_first =
++                len >= 4 ? *reinterpret_cast<const uint32_t*>(bytes) : 0;
++            resolve_probe_before_ok = true;
++            resolve_probe_pending = true;
++            resolve_probe_index = ++resolve_probe_count;
++            resolve_probe_extent_start = plan.info.copy_dest_extent_start;
++            resolve_probe_extent_length = plan.info.copy_dest_extent_length;
++            resolve_probe_dest_base = plan.dest_base;
++            resolve_probe_dest_pitch = plan.dest_pitch;
++            resolve_probe_dest_info = plan.dest_info;
++          }
++        }
++      }
++    }
++  }
+   const int32_t minimap_swap = REXCVAR_GET(fh1_debug_minimap_capture_swap);
+   const bool capture_minimap_frame = minimap_swap > 0 &&
+                                      presented_output_frames_ == uint64_t(minimap_swap);
+@@ -6197,6 +6271,82 @@
+         after_hash, after_nonzero, after_ok, after_hash != mirror_before_hash, probe_hash,
+         probe_nonzero);
+   }
++  // FH1 resolve probe (Phase 2f) - after: read the mirror at the destination
++  // extent and the staging buffer now that the resolve + staging copy have
++  // completed, and log the before/after pixel verdict.
++  if (resolve_probe_pending) {
++    uint64_t resolve_probe_after_words_nz = 0;
++    uint32_t resolve_probe_after_first = 0;
++    double resolve_probe_after_mean[4] = {0.0, 0.0, 0.0, 0.0};
++    bool resolve_probe_after_ok = false;
++    uint64_t resolve_probe_staging_words_nz = 0;
++    uint32_t resolve_probe_staging_first = 0;
++    bool resolve_probe_staging_ok = false;
++    // The mirror is final here: the staging copy ran above and mirror_hash
++    // (store probe) already WaitForGpu'd. Read the mirror extent.
++    if (WaitForGpu()) {
++      resolve_readback_scratch_.resize(resolve_probe_extent_length);
++      if (upload_sink->ReadbackFromHostBuffer(resolve_probe_extent_start,
++                                              resolve_readback_scratch_.data(),
++                                              resolve_probe_extent_length)) {
++        const uint8_t* bytes = resolve_readback_scratch_.data();
++        const size_t len = resolve_probe_extent_length;
++        uint64_t lane_sum[4] = {0, 0, 0, 0};
++        uint64_t lane_count[4] = {0, 0, 0, 0};
++        for (size_t i = 0; i < len; ++i) {
++          lane_sum[i & 3] += bytes[i];
++          ++lane_count[i & 3];
++        }
++        for (int lane = 0; lane < 4; ++lane) {
++          resolve_probe_after_mean[lane] =
++              lane_count[lane] ? double(lane_sum[lane]) / double(lane_count[lane]) : 0.0;
++        }
++        for (size_t i = 0; i + 3 < len; i += 4) {
++          if (*reinterpret_cast<const uint32_t*>(bytes + i)) {
++            ++resolve_probe_after_words_nz;
++          }
++        }
++        resolve_probe_after_first =
++            len >= 4 ? *reinterpret_cast<const uint32_t*>(bytes) : 0;
++        resolve_probe_after_ok = true;
++      }
++      // The staging buffer holds the dispatch's own output, independent of
++      // the copy into the mirror.
++      if (use_staging_copy) {
++        resolve_readback_scratch_.resize(resolve_probe_extent_length);
++        if (upload_sink->ReadbackResolveStaging(0, resolve_readback_scratch_.data(),
++                                                resolve_probe_extent_length)) {
++          const uint8_t* sbytes = resolve_readback_scratch_.data();
++          for (size_t i = 0; i + 3 < resolve_probe_extent_length; i += 4) {
++            if (*reinterpret_cast<const uint32_t*>(sbytes + i)) {
++              ++resolve_probe_staging_words_nz;
++            }
++          }
++          resolve_probe_staging_first = resolve_probe_extent_length >= 4
++                                            ? *reinterpret_cast<const uint32_t*>(sbytes)
++                                            : 0;
++          resolve_probe_staging_ok = true;
++        }
++      }
++    }
++    REXGPU_INFO(
++        "FH1 resolve probe: swap={} probe#{} call={} src={} band={} dest_base={:08X} "
++        "dest_pitch={} extent={:08X}+{} bpp_log2={} staging_ok={} staging_words_nz={} "
++        "staging_first={:08X} mirror_before_ok={} before_mean={:.1f},{:.1f},{:.1f},{:.1f} "
++        "before_words_nz={} before_first={:08X} mirror_after_ok={} after_mean={:.1f},{:.1f},{:.1f},{:.1f} "
++        "after_words_nz={} after_first={:08X}",
++        presented_output_frames_, resolve_probe_index, resolve_call_count_,
++        plan.resolve_key.Describe(), untile_band, resolve_probe_dest_base,
++        resolve_probe_dest_pitch, resolve_probe_extent_start, resolve_probe_extent_length,
++        (resolve_probe_dest_info >> 16u) & 3u, resolve_probe_staging_ok ? 1 : 0,
++        resolve_probe_staging_words_nz, resolve_probe_staging_first,
++        resolve_probe_before_ok ? 1 : 0, resolve_probe_before_mean[0],
++        resolve_probe_before_mean[1], resolve_probe_before_mean[2], resolve_probe_before_mean[3],
++        resolve_probe_before_words_nz, resolve_probe_before_first,
++        resolve_probe_after_ok ? 1 : 0, resolve_probe_after_mean[0], resolve_probe_after_mean[1],
++        resolve_probe_after_mean[2], resolve_probe_after_mean[3], resolve_probe_after_words_nz,
++        resolve_probe_after_first);
++  }
+   // FH1 follow-up probe (Q2): does the resolve source already contain grey,
+   // or does the resolve turn it dark? At resolve time for the scene target
+   // (dest 1C4E1000), read the ACTUAL MSAA source texture as the resolve sees
+--- /tmp/flags_orig.cpp	2026-11-17 23:40:12.242817293 +0000
++++ /tmp/flags.cpp	2026-11-17 23:39:12.359817754 +0000
+@@ -360,6 +360,14 @@
+                      "Diagnostic: how many draws fh1_debug_edram3d_probe reads back (two reads "
+                      "before, one after), each of them a full surface readback")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(fh1_debug_resolve_probe_from, 3000, "GPU",
++                     "Diagnostic: the presented-frame index at which fh1_debug_resolve_probe "
++                     "starts probing EDRAM band-2 resolves (0 = from the first frame)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(fh1_debug_resolve_probe_draws, 12, "GPU",
++                     "Diagnostic: how many EDRAM band-2 resolves fh1_debug_resolve_probe reads "
++                     "back (mirror before/after + staging), each a full extent readback")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ REXCVAR_DEFINE_INT32(fh1_debug_srv_bind_all_from, 0, "GPU",
+                      "Diagnostic: at this presented-frame index, log the bind result of "
+                      "every texture fetch (any size) in GetActiveTextureBindfulSRV, "

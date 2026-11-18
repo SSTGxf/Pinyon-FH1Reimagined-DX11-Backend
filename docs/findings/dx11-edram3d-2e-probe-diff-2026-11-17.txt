@@ -1,0 +1,32 @@
+﻿--- command_processor.cpp (Phase 2d)
++++ command_processor.cpp (Phase 2e)
+@@ -3594,11 +3594,13 @@
+           uint64_t(std::max<int32_t>(REXCVAR_GET(fh1_debug_edram3d_probe_from), 0))) {
+     static uint32_t edram3d_probe_draws = 0;
+     const int32_t edram3d_budget = REXCVAR_GET(fh1_debug_edram3d_probe_draws);
+-    // Loosened trigger (Phase 2d): scan every bound render-target slot for a
+-    // non-depth EDRAM colour surface (base_tiles == 0) instead of hardcoding
+-    // slot 1, and drop the pitch/MSAA and used_texture_mask gates. The slot
+-    // index is the pending_key index (0 = depth, 1..N = colour RTs), so scan
+-    // 0..kMaxColorRenderTargets to cover all four colour RTs.
++    // Phase 2e: EDRAM-only trigger. Keep the Phase 2d slot scan (every bound
++    // render-target slot) and the dropped used_texture_mask gate, but restore
++    // the EDRAM family check (pitch_tiles == 32 && 4x MSAA) so the probe only
++    // fires on the EDRAM surface (0/32/4x/c3) and the budget cannot be spent
++    // on composite/loading draws. The slot index is the pending_key index
++    // (0 = depth, 1..N = colour RTs), so scan 0..kMaxColorRenderTargets to
++    // cover all four colour RTs.
+     const bool edram3d_is_tri =
+         primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleList ||
+         primitive_processing_result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip ||
+@@ -3613,7 +3615,9 @@
+           continue;
+         }
+         const Fh1SurfaceKey candidate_key = native_executor_->pending_key(rt_slot);
+-        if (candidate_key.is_depth || candidate_key.base_tiles != 0) {
++        if (candidate_key.is_depth || candidate_key.base_tiles != 0 ||
++            candidate_key.pitch_tiles != 32 ||
++            candidate_key.msaa != uint32_t(xenos::MsaaSamples::k4X)) {
+           continue;
+         }
+         D3D11Fh1NativeSurface* candidate_surface =
