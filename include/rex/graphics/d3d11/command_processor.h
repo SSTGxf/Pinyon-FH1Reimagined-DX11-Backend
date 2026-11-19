@@ -64,6 +64,9 @@ class D3D11CommandProcessor : public CommandProcessor {
     uint64_t issued = 0;
     uint64_t skipped_memexport = 0;
     uint64_t dropped_memexport = 0;
+    // A draw counts in both if both shaders write memexport.
+    uint64_t dropped_memexport_vertex = 0;
+    uint64_t dropped_memexport_pixel = 0;
     uint64_t skipped_only_control = 0;
     uint64_t skipped_both_barriers = 0;
     uint64_t passes_in_color_depth_mode = 0;
