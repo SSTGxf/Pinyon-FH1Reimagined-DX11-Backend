@@ -100,6 +100,57 @@ the edram3d probe, and the resolve probe. The full reports are in
   (`rexgpu-fh1-d11-rowfix.dll`, `rexgpu-fh1-091-port.dll`, and the rebuilt
   WPF + Desktop launcher exe/dll).
 
+## Source status (2026-11-19)
+
+- **Upstream DX11 backend — it renders the full world.** Upstream Pinyon
+  lead nerijs built a D3D11 backend as a port of his own D3D12 backend
+  (bindful path, runtime shader translation). It renders the FULL world
+  correctly in DX11 — The Gauntlet, road, terrain, trees, mountains, sky,
+  car, HUD, minimap — the first correct full-world DX11 render. Merged
+  into upstream dev as commit `7404c62a` (`feat/d3d11`), SDK `0c2187cb`.
+  Seth swapped that SDK into his 0.9.1 tree, built it, installed it, and
+  tested it on the GTX 570: **the game works properly in D3D11** — title
+  screen 60 FPS, full world renders correctly in free roam, no
+  white/missing world. FPS: ~30 idle/title, **avg 10 while driving**
+  (the old build was 4–5). Correctness is solved; performance is the
+  remaining job. Adapter index is session-dependent (SSH: GTX 570 is 0;
+  interactive desktop: RX 5700 XT is 0, GTX 570 is 1), so the live
+  setting is `d3d11_adapter = 1`. Launch via `pinyon.py` scheduled task
+  with PowerShell Bypass. Upstream performance: RTX 4080 (FL 11_0) DX11
+  11.1 ms vs Vulkan 8.4 ms (~32% gap); the backlog has no dedicated
+  performance items.
+- **Memexport — exonerated, supersedes the 2026-11-18 "prime suspect".**
+  FH1 issues **ZERO memexport draws** (census over 28,560 frames, and a
+  3,207-frame / 2.29M-draw free-roam run also returned 0). The memexport
+  drop was never the render blocker. Do not build the CPU memexport route
+  to fix the render bug.
+- **Executor port — upstream's model into Seth's backend.** Copilot
+  ported upstream's `Fh1NativeExecutor` PrepareTargets signature cache
+  into Seth's D: tree executor (2 files, build `BUILD_EXIT=0`, DLL
+  `CFD2861B`). Verified against source: signature cache + `prepare_cache_hits`
+  in place, row/per-band/memexport-counter fixes intact, resolve path
+  uses `MarkRangeAsResolved` which does call `RangeWrittenByGpu`. Not
+  ported: upstream CPU timing fields, depth-overwrite interface. Seth's
+  executor already had the ownership / `ClaimRect` / `BindTargets`
+  machinery, so the port was mainly the cache. See
+  [`docs/findings/dx11-executor-port-2026-11-19.md`](docs/findings/dx11-executor-port-2026-11-19.md)
+  and the prompt in
+  [`docs/dx11-executor-port-copilot-prompt.md`](docs/dx11-executor-port-copilot-prompt.md).
+  **The ported backend was never in-game tested**: its DLL is not
+  ABI-compatible with the installed runtime ("Failed to load GPU plugin
+  'fh1'"), so it cannot be tested by DLL swap — it needs its matching
+  exe/runtime. The working upstream DLL (`0B5A8F44…`) was restored.
+- **Launcher — DX11 + GPU selection, set-graphics fixed.** The rebuilt
+  launcher shows Graphics API: Direct3D 11 and GPU: NVIDIA GeForce GTX
+  570. It errored on load because the install location's
+  `set-graphics-experiment.ps1` was the stock upstream script (no
+  `D3d11Adapter`, `GraphicsApi` Vulkan-only, Apply forced `gpu_backend`
+  back to Vulkan). Fixed: the script now accepts `D3d11Adapter` and
+  `d3d11`, reports the actual backend/adapter, and Apply writes
+  `d3d11_adapter` without forcing Vulkan. Verified: Get and Apply return
+  `graphics_api: d3d11`, `d3d11_adapter: 1`. The fixed script is in
+  [`launcher-gpu-selector/`](launcher-gpu-selector/).
+
 ## How it works
 
 The guest (Xbox 360) EDRAM is modelled as a 2048-tile grid. Front-buffer
@@ -269,38 +320,38 @@ not used as an explanation for the grey EDRAM surface.
 | Draw #23 interpolants / system constant | Not captured |
 | t7 mirror | Confirmed separate defect |
 | 0.9.1 port | Full-game build SUCCEEDED (06:01 AM PC time); D3D11 launched on GTX 570 at 60 FPS (first); in-game white screen + road strip only, sustained free roam NOT confirmed |
-| Memexport draws | Dropped by the command processor (no VS UAVs at FL 11_0) — prime suspect; no Step C transfer handling; translator DOES emit the stores, the carrier is missing |
+| Upstream remake (2026-11-19) | **Full world renders correctly in D3D11 on the GTX 570** (upstream SDK 0c2187cb, merged as feat/d3d11); title 60 FPS, free roam works, avg 10 FPS driving |
+| Memexport draws | **EXONERATED (2026-11-19)** — FH1 issues ZERO memexport draws (census 28,560 frames; 3,207-frame free-roam run also 0). The drop was never the render blocker; do not build the CPU memexport route for the render bug |
 | Memexport counter | Bug found: summary printed `skipped_memexport` (never incremented) instead of `dropped_memexport` (never printed); Phase 1 fix (split counters + per-draw trace) in the 0.9.1 tree only — NOT in this repo's D: source yet |
-| CPU memexport route | Designed (interpreter + ExportSink); measurement blocked until the instrumented build runs |
-| Launcher | DirectX 11 + GPU selector (GTX 570 / RX 5700 XT / Auto); setting saves (`d3d11`, `d3d11_adapter: GTX`); DX11 build installed in the launcher location |
+| Executor port (2026-11-19) | Upstream PrepareTargets signature cache ported into Seth's D: executor (build OK, DLL CFD2861B); verified in source; **never in-game tested** — the ported DLL is not ABI-compatible with the installed runtime (plugin load failure), needs its matching exe/runtime |
+| Launcher | DirectX 11 + GPU selector (GTX 570 / RX 5700 XT / Auto); setting saves (`d3d11`, `d3d11_adapter: 1`); `set-graphics-experiment.ps1` fixed to accept `d3d11` + `D3d11Adapter` (integer); DX11 build installed in the launcher location |
 
-Menus, cutscenes, and the 2D HUD render fine. D3D11 now launches on the
-GTX 570 at 60 FPS, but in free roam the world is still white above the
-road strip. EDRAM gets coloured (Phase 2e probe #7: 28.9% changed,
-sky-blue), so the colour is lost in the resolve or the composite — not in
-the 3D render — and the memexport drop is now the prime suspect: every
-draw whose vertex or pixel shader writes memexport is dropped before it
-reaches the GPU, with no transfer handling anywhere. After the rowfix,
-the first test showed the world gone in the car-preview view; a free-roam
-retest is pending, so the fix is unproven and the render bug is NOT
-fixed.
+Menus, cutscenes, and the 2D HUD render fine. **The world now renders in
+D3D11 on the GTX 570** — the upstream remake (SDK 0c2187cb) shows the full
+world correctly in free roam. EDRAM gets coloured (Phase 2e probe #7:
+28.9% changed, sky-blue), and the upstream executor's surface-ownership
+model is what makes the world land. Memexport is exonerated (zero draws),
+so the render bug is solved upstream, not by a memexport fix. Seth's own
+backend still needs its executor port tested in-game (via its matching
+exe/runtime, not a DLL swap).
 
-**Performance:** D3D11 free roam runs 4–5 FPS on the GTX 570. The
-bottleneck is a single CPU decoder thread (~76% of frame time) plus
-workload streaming. 30 FPS at 720p is the realistic target.
+**Performance:** the upstream DX11 build runs ~30 FPS idle/title and
+**avg 10 FPS while driving** on the GTX 570 (the old build was 4–5).
+The frame is ~100 ms; 30 FPS needs ~33 ms. The GPU is the most likely
+bottleneck on the 2010 card at 720p 4x MSAA, with CPU per-draw work,
+transfers, and the cross-adapter present copy as the other costs. 30 FPS
+at 720p is the realistic target.
 
-**Next, in order:** (1) run the instrumented 0.9.1 build to free roam
-and measure the real vertex/pixel memexport drop split from all rotated
-logs; (2) build the CPU memexport route (sink pairing
-`kExportAddress` / `kExportData0..4`, writable write path, command-
-processor call site, interpreter timing measured); (3) after the memexport
-fix, re-measure the resolve/composite path — fix the resolve probe gate
-on D: (drop `untile_band == 2` or use a rect check) and determine whether
-the loss is dispatch vs copy vs composite; (4) apply the Phase 1 counter
-fix to the D: tree so it lands in this repo's source; (5) free-roam
-retest of the rowfix on the D: rebuild — if the world is still gone,
-revert the fix and retest (pre-fix was flat-grey-but-present). Full
-detail: [`docs/findings/`](docs/findings/).
+**Next, in order:** (1) run a profiling driving session with
+`fh1_native_gpu_profile` on the upstream build and get the CPU timing
+breakdown (prepare_targets / transfers / bind_targets / resolves) plus
+the upload stats, to find the real bottleneck; (2) optimize from that
+data — the executor signature cache is already in Seth's backend, the
+remaining gains depend on what the timing says; (3) test Seth's ported
+executor in-game via its matching exe/runtime (D: tree `run_game.cmd`)
+and confirm the world renders with his own backend; (4) apply the
+Phase 1 counter fix to the D: tree so it lands in this repo's source.
+Full detail: [`docs/findings/`](docs/findings/).
 
 ## Upstream
 - Frame generation (DLSS, FSR, LGSS) is landing upstream; the plan here is
@@ -360,11 +411,13 @@ claiming a change is in the binary.
 - **Multisampled depth cannot be read back on D3D11.** Staging cannot
   take MSAA and `ResolveSubresource` has no depth support. That is an open
   instrument gap.
-- **The flat grey world — loss is downstream of EDRAM.** EDRAM gets
-  coloured (Phase 2e); the colour is lost in the resolve or the composite.
-  The `source_row_offset` fix (`= 0`) is applied but NOT proven — the
-  first test showed the world gone in the car-preview view, and a
-  free-roam retest is pending. The render bug is NOT fixed.
+- **The flat grey world — solved upstream, Seth's backend unproven.**
+  The upstream remake renders the full world correctly in D3D11 on the
+  GTX 570, so the loss is fixed by the upstream executor's
+  surface-ownership model, not by the row fix or a memexport route.
+  Seth's own backend (with the ported signature cache) is built but has
+  NOT been in-game tested — its DLL is not ABI-compatible with the
+  installed runtime, so it needs its matching exe/runtime to test.
 - **Draw #23 wipe.** Pixel-shader translation and blend state are both
   verified correct; the fault, if any, is upstream in the shader inputs.
 - **MSAA.** The original game's MSAA implementation is extremely heavy,

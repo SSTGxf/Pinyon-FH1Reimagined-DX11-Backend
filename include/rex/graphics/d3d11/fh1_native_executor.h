@@ -278,6 +278,21 @@ class D3D11Fh1NativeExecutor {
   SurfaceKey pending_keys_[1 + xenos::kMaxColorRenderTargets];
   D3D11Fh1NativeSurface* pending_surfaces_[1 + xenos::kMaxColorRenderTargets] = {};
 
+  struct PrepareSignature {
+    uint64_t generation = 0;
+    uint32_t used_bits = 0;
+    uint32_t length_tiles = 0;
+    bool stencil_written = false;
+    int32_t claim_x0 = 0;
+    int32_t claim_y0 = 0;
+    int32_t claim_x1 = 0;
+    int32_t claim_y1 = 0;
+    uint32_t keys[1 + xenos::kMaxColorRenderTargets] = {};
+    bool operator==(const PrepareSignature&) const = default;
+  };
+  PrepareSignature last_prepare_;
+  uint64_t prepare_cache_hits_ = 0;
+
   // Transfer resources (created on the first transfer that needs them).
   ID3D11VertexShader* transfer_vertex_shader_ = nullptr;
   ID3D11Buffer* transfer_constants_ = nullptr;

@@ -9,8 +9,11 @@ param(
     [string]$PostEffect = 'none',
     [ValidateSet(1, 2, 3, 4)]
     [int]$ResolutionScale = 1,
-    [ValidateSet('vulkan')]
+    [ValidateSet('vulkan', 'd3d11')]
     [string]$GraphicsApi = 'vulkan',
+    # Direct3D 11 adapter index (-1 = first FL 11_0 adapter, -2 = WARP).
+    [ValidateRange(-2, 64)]
+    [int]$D3d11Adapter = -1,
     [ValidateSet('bilinear', 'cas', 'fsr', 'fsr2', 'fsr3', 'dlss')]
     [string]$OutputScaling = 'bilinear',
     [ValidateSet('true', 'false')]
@@ -104,6 +107,9 @@ fh1_msaa_single_sample = true
 draw_resolution_scale_x = 1
 draw_resolution_scale_y = 1
 clear_memory_page_state = false
+spirv_specialize_texture_signs = true
+spirv_fast_pixel_math = true
+spirv_implicit_lod_2d = true
 '@
 }
 
@@ -234,13 +240,21 @@ $gamePresets = [ordered]@{
         pinyon_shift_fh1_shadows = 'true'; pinyon_shift_fh1_env_map_rate = '1'
         fh1_untile_predicated_tiling = 'false' }
 }
+# The cheap presets also turn on the shader translation settings measured on
+# a UHD 620 (settings_menu.cpp, GRAPHICS PRESET); the others set them back.
+$shaderMath = @('spirv_specialize_texture_signs', 'spirv_fast_pixel_math', 'spirv_implicit_lod_2d')
+foreach ($name in @($gamePresets.Keys)) {
+    $on = $name -in @('ultra_low_30', 'low_spec_60', 'balanced_40')
+    foreach ($setting in $shaderMath) { $gamePresets[$name][$setting] = if ($on) { 'true' } else { 'false' } }
+}
 
 # The in-game preset the file matches, as the settings screen shows it.
 function Get-GamePreset([string]$Text) {
     $defaults = @{ present_effect = '"bilinear"'; fh1_msaa_single_sample = 'false'
         host_present_fps_limit = '0'; anisotropic_override = '-1'; swap_post_effect = '"none"'
         pinyon_shift_fh1_render_fps_limit = '0'; draw_resolution_scale_x = '1'; draw_resolution_scale_y = '1'
-        pinyon_shift_fh1_shadows = 'true'; pinyon_shift_fh1_env_map_rate = '1'; fh1_untile_predicated_tiling = 'false' }
+        pinyon_shift_fh1_shadows = 'true'; pinyon_shift_fh1_env_map_rate = '1'; fh1_untile_predicated_tiling = 'false'
+        spirv_specialize_texture_signs = 'false'; spirv_fast_pixel_math = 'false'; spirv_implicit_lod_2d = 'false' }
     foreach ($name in $gamePresets.Keys) {
         $all = $true
         foreach ($setting in $gamePresets[$name].GetEnumerator()) {
@@ -269,8 +283,9 @@ function Get-SettingsResult([string]$Text, [string]$BackupPath, [string]$Operati
     $vsyncEnabled = (Get-TomlValue $Text 'vsync' 'true') -eq 'true'
     $presentationFps = [int](Get-TomlValue $Text 'host_present_fps_limit' '0')
     $renderFps = [int](Get-TomlValue $Text 'pinyon_shift_fh1_render_fps_limit' '0')
-    # Player settings use Vulkan; schema 28 migrates legacy backend selections.
-    $graphicsApi = 'vulkan'
+    # Schema 28 made Vulkan the player default; Direct3D 11 is selectable
+    # again via the launcher. Report the backend actually in the file.
+    $graphicsApi = (Get-TomlValue $Text 'gpu_backend' '"vulkan"').Trim('"').ToLowerInvariant()
     $presetName = if ($resolutionScale -eq 2) {
         'experimental_2x'
     } elseif ($resolutionScale -eq 3) {
@@ -295,6 +310,7 @@ function Get-SettingsResult([string]$Text, [string]$BackupPath, [string]$Operati
             game_preset = Get-GamePreset $Text
             resolution_scale = $resolutionScale
             graphics_api = $graphicsApi
+            d3d11_adapter = [int](Get-TomlValue $Text 'd3d11_adapter' '-1')
             output_scaling = (Get-TomlValue $Text 'present_effect' '"bilinear"').Trim('"').ToLowerInvariant()
             # Where the image lands, for the launcher's resolution line.
             fullscreen = (Get-TomlValue $Text 'fullscreen' 'true') -eq 'true'
@@ -361,8 +377,15 @@ switch ($Action) {
         if ($schema -lt 24) { $text = Remove-TomlValue $text 'readback_resolve' }
         # Schema 26 turned clear_memory_page_state off (src/pinyon_shift_app.cpp).
         if ($schema -lt 26) { $text = Set-TomlValue $text 'clear_memory_page_state' 'false' }
-        # Schema 28 makes Vulkan the only supported player backend.
-        $text = Set-TomlValue $text 'gpu_backend' '"vulkan"'
+        # Schema 28 made Vulkan the only supported player backend; the
+        # launcher can now select Direct3D 11 again (upstream feat/d3d11).
+        # A GraphicsApi passed on the command line wins; otherwise keep the
+        # backend already in the file (do not force it back to Vulkan).
+        if ($PSBoundParameters.ContainsKey('GraphicsApi')) {
+            $text = Set-TomlValue $text 'gpu_backend' ('"' + $GraphicsApi + '"')
+        } elseif (-not [regex]::IsMatch($text, '(?m)^[ \t]*gpu_backend[ \t]*=')) {
+            $text = Set-TomlValue $text 'gpu_backend' '"vulkan"'
+        }
         $text = Set-TomlValue $text 'gpu_record_thread' 'true'
         # Schema 28 turns off depth of field once, as the game does
         # (src/pinyon_shift_app.cpp); a choice passed below still wins.
@@ -402,6 +425,9 @@ switch ($Action) {
         }
         if ($bound.ContainsKey('OutputScaling')) {
             $text = Set-TomlValue $text 'present_effect' ('"' + $OutputScaling + '"')
+        }
+        if ($bound.ContainsKey('D3d11Adapter')) {
+            $text = Set-TomlValue $text 'd3d11_adapter' ([string]$D3d11Adapter)
         }
         if ($bound.ContainsKey('Anisotropy')) {
             $override = switch ($Anisotropy) { 0 { -1 } 4 { 3 } 8 { 4 } 16 { 5 } }

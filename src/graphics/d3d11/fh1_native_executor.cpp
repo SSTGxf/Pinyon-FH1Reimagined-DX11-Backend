@@ -635,6 +635,7 @@ bool D3D11Fh1NativeExecutor::Initialize(const D3D11Fh1NativeExecutorConfig& conf
   config_ = config;
   tiles_.Reset();
   untile_bands_.clear();
+  last_prepare_ = {};
   initialized_ = true;
   REXGPU_INFO(
       "D3D11 FH1 native executor: initialized (scale 1, EDRAM tiles {} x {} B, shared with the "
@@ -651,6 +652,7 @@ void D3D11Fh1NativeExecutor::Shutdown() {
   initialized_ = false;
   pending_targets_valid_ = false;
   pending_used_bits_ = 0;
+  last_prepare_ = {};
   for (D3D11Fh1NativeSurface*& surface : pending_surfaces_) {
     surface = nullptr;
   }
@@ -816,12 +818,12 @@ void D3D11Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw, int32_t cla
           MakeColorKey(color_info.color_base, pitch_tiles, msaa, color_info.color_format);
       used_bits |= 1u << (1 + i);
     }
-    for (uint32_t i = 1; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
       if (!(used_bits & (1u << i))) {
         continue;
       }
-      for (uint32_t j = 1; j < 1 + xenos::kMaxColorRenderTargets; ++j) {
-        if (j != i && j > i && (used_bits & (1u << j)) &&
+      for (uint32_t j = 0; j < 1 + xenos::kMaxColorRenderTargets; ++j) {
+        if (j != i && (j == 0 || j > i) && (used_bits & (1u << j)) &&
             pending_keys_[j].base_tiles == pending_keys_[i].base_tiles) {
           used_bits &= ~(1u << j);
         }
@@ -830,7 +832,53 @@ void D3D11Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw, int32_t cla
   }
   if (!used_bits) {
     pending_used_bits_ = 0;
+    last_prepare_ = {};
     return;
+  }
+
+  PrepareSignature signature;
+  signature.generation = tiles_.generation();
+  signature.used_bits = used_bits;
+  const uint32_t msaa_y_log2 =
+      uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k2X));
+  const int32_t clamped_height =
+      std::max<int32_t>(0, std::min<int32_t>(claim_y1, int32_t(config_.untile_height)) -
+                                std::max<int32_t>(0, claim_y0));
+  signature.length_tiles =
+      ((uint32_t(clamped_height) << msaa_y_log2) +
+       xenos::kEdramTileHeightSamples - 1) /
+          xenos::kEdramTileHeightSamples *
+      pitch_tiles;
+  signature.stencil_written =
+      (used_bits & 1) &&
+      (draw.normalized_depth_control.stencil_enable ||
+       draw.normalized_depth_control.z_enable);
+  signature.claim_x0 = claim_x0;
+  signature.claim_y0 = claim_y0;
+  signature.claim_x1 = claim_x1;
+  signature.claim_y1 = claim_y1;
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (used_bits & (1u << i)) {
+      signature.keys[i] = pending_keys_[i].Pack();
+    }
+  }
+  if (signature == last_prepare_) {
+    ++prepare_cache_hits_;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (!(used_bits & (1u << i))) {
+        continue;
+      }
+      pending_surfaces_[i] =
+          config_.surfaces->FindSurface(pending_keys_[i].Pack());
+      if (!pending_surfaces_[i]) {
+        last_prepare_ = {};
+        break;
+      }
+    }
+    if (last_prepare_ == signature) {
+      pending_used_bits_ = used_bits;
+      return;
+    }
   }
 
   // The surfaces exist before the claims: a transfer needs the destination's
@@ -855,6 +903,12 @@ void D3D11Fh1NativeExecutor::PrepareTargets(const Fh1DrawInfo& draw, int32_t cla
                      (i == 0) && depth_stencil_written);
   }
   pending_used_bits_ = used_bits;
+  if (used_bits == signature.used_bits) {
+    signature.generation = tiles_.generation();
+    last_prepare_ = signature;
+  } else {
+    last_prepare_ = {};
+  }
 }
 
 void D3D11Fh1NativeExecutor::ClaimTargetTiles(const SurfaceKey& key,
@@ -2885,12 +2939,12 @@ void D3D11Fh1NativeExecutor::OnSwap(uint64_t frame, uint32_t frontbuffer_address
 
 void D3D11Fh1NativeExecutor::LogStats(uint64_t frame) {
   REXGPU_INFO(
-      "D3D11 FH1 native executor: frame={} prepares={} binds={} draws={} skipped={} claims={} "
+      "D3D11 FH1 native executor: frame={} prepares={} prepare_cache_hits={} binds={} draws={} skipped={} claims={} "
       "tiles={} transfers={} transfer_tiles={} (draws={} copies={}) "
       "transfer_skipped={}/{}/{} words={} word_rects={} words_written={} batches={} "
       "depth_direct={} depth_passes={} stencil_passes={} "
       "depth_verified={} owner_resolves={} surfaces={} owner_gen={}",
-      frame, prepares_, binds_, draws_, skipped_draws_, claims_, claimed_tiles_, transfers_,
+      frame, prepares_, prepare_cache_hits_, binds_, draws_, skipped_draws_, claims_, claimed_tiles_, transfers_,
       transfer_tiles_, transfer_draws_, transfer_copies_, transfer_skipped_source_,
       transfer_skipped_format_, transfer_skipped_disabled_, transfer_words_dispatches_,
       transfer_word_rects_, transfer_words_, transfer_batches_, transfer_depth_direct_,
