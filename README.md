@@ -430,6 +430,10 @@ claiming a change is in the binary.
 `b8f68e89c6192577747ab452aa5598ef` on both captures. If that hash moves,
 the default path changed.
 
+## End of support 
+
+As of Pinyon 9.5. dx11 is semi implemented and will continued to be updated through the PinyonShift repo. All future updates will have dx11 proper support. Enjoy!
+
 The running log is [`docs/DX11_FINISH_NOTES.md`](docs/DX11_FINISH_NOTES.md)
 — it is updated at every step boundary and is the source of truth for
 where the work stands.
